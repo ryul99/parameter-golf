@@ -522,8 +522,16 @@ def block_attn_res(
         [B, T, D] - attention-computed hidden state
     """
     if block_ptr == 0:
-        # No completed blocks yet - fallback
-        return partial_block if partial_block is not None else torch.zeros_like(block_storage[0])
+        # No completed blocks yet - use projection weights to scale partial_block
+        if partial_block is not None:
+            # Normalize and apply learned scaling via projection weights
+            h = norm_fn(partial_block)
+            # proj.weight is [1, D], h is [B, T, D]
+            # Use element-wise multiplication followed by sum over D to get scalar scaling
+            scaling = (h * proj.weight.transpose(0, 1).unsqueeze(1)).sum(dim=-1, keepdim=True)  # [B, T, 1]
+            return partial_block * scaling
+        else:
+            return torch.zeros_like(block_storage[0])
 
     # Stack active blocks and optionally partial_block
     # V: [num_blocks, B, T, D]
