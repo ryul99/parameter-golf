@@ -818,7 +818,7 @@ class GPT(nn.Module):
         if self.block_storage.shape[1:] != (bsz, seq_len, dim):
             self.block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous()
 
-        block_storage = self.block_storage
+        block_storage = self.block_storage.clone()
         # Store normalized embedding as the first block representation
         block_storage[0] = x
         block_ptr = 1  # Next block slot to use
