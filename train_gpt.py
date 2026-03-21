@@ -703,7 +703,7 @@ class Block(nn.Module):
         self,
         block_storage: Tensor,
         block_ptr: int,
-        partial_block: Tensor | None,
+        hidden_states: Tensor,
     ) -> tuple[Tensor, int, Tensor | None]:
         """
         Forward pass with Block Attention Residuals.
@@ -711,7 +711,7 @@ class Block(nn.Module):
         Args:
             block_storage: [max_blocks, B, T, D] tensor for block representations
             block_ptr: int - current number of active blocks
-            partial_block: [B, T, D] or None - current intra-block partial sum (None at block boundaries)
+            hidden_states: [B, T, D] - input to this layer (output from previous layer)
 
         Returns:
             block_storage: updated block storage tensor
@@ -719,19 +719,13 @@ class Block(nn.Module):
             partial_block: updated intra-block partial sum
         """
         layers_per_block = self.block_size // 2
-        # Block boundary check: only trigger at layers 2, 4, 6, ... (NOT layer 0)
-        #
-        # Architectural choice: The spec's `layer_number % layers_per_block == 0` creates
-        # malformed blocks because it triggers boundaries at layer 0, 2, 4, ..., which
-        # doesn't properly account for the embedding being the first block.
-        #
-        # This implementation fixes that by:
-        # - Storing embedding as block_storage[0] (block_ptr starts at 1)
-        # - Triggering boundaries at layers 2, 4, 6, ... (where layer_idx > 0)
-        # - Creating asymmetric blocks: first block = [embed + attn0 + mlp0], subsequent blocks = [attnN + mlpN]
-        #
-        # This ensures all blocks are complete and well-formed.
-        is_block_start = self.layer_idx > 0 and self.layer_idx % layers_per_block == 0
+
+        # Reset partial_block to current layer's input (spec: partial_block = hidden_states)
+        partial_block = hidden_states
+
+        # Block boundary check: trigger at layers 0, 2, 4, ...
+        # Spec: layer_number % (block_size // 2) == 0
+        is_block_start = self.layer_idx % layers_per_block == 0
 
         # === Block AttnRes before attention ===
         # Attend over completed blocks + current partial_block.
@@ -739,7 +733,6 @@ class Block(nn.Module):
 
         # === Check block boundary AFTER AttnRes ===
         # This matches the spec order: apply block_attn_res first, then check boundary.
-        # At block boundaries, store the completed block from previous accumulation and reset.
         if is_block_start:
             # Clone entire block_storage to create a new tensor that's not part of the computation graph
             # This is necessary to avoid in-place modification errors with autograd
@@ -838,14 +831,12 @@ class GPT(nn.Module):
         # Create working block_storage from registered buffer
         # Clone to create independent tensor, then expand to match input dimensions
         block_storage = self.block_storage.clone().expand(-1, bsz, seq_len, dim).contiguous()
-        # Initialize: embedding is the first completed block (spec: blocks includes embedding)
-        block_storage[0] = x.detach().clone()
-        block_ptr = 1  # Number of completed blocks in storage
-        partial_block: Tensor | None = None  # Start fresh block at layer 0
+        block_ptr = 0  # Start with no completed blocks (layer 0 boundary will store embedding)
 
         # Process all layers
         for block in self.blocks:
-            block_storage, block_ptr, partial_block = block(block_storage, block_ptr, partial_block)
+            block_storage, block_ptr, partial_block = block(block_storage, block_ptr, x)
+            x = partial_block  # Update x for next layer (carries forward if not at boundary)
 
         # Use final partial_block as the output (should always be Tensor after all layers)
         x = partial_block  # type: ignore[assignment]
