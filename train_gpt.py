@@ -71,8 +71,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    attnres_proj_init_std = float(os.environ.get("ATTNRES_PROJ_INIT_STD", "0.02"))
-    block_size = int(os.environ.get("BLOCK_SIZE", "4"))
+    attnres_proj_init_std = float(os.environ.get("ATTNRES_PROJ_INIT_STD", 0.02))
+    block_size = int(os.environ.get("BLOCK_SIZE", 4))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
