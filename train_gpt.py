@@ -525,38 +525,23 @@ def block_attn_res(
         # No completed blocks yet - fallback
         return partial_block if partial_block is not None else torch.zeros_like(block_storage[0])
 
-    bsz, seq_len, dim = partial_block.shape if partial_block is not None else block_storage.shape[1:]
-    num_blocks = block_ptr + (1 if partial_block is not None else 0)
+    # Stack active blocks and optionally partial_block
+    # V: [num_blocks, B, T, D]
+    blocks_list = [block_storage[i] for i in range(block_ptr)]
+    if partial_block is not None:
+        blocks_list.append(partial_block)
+    V = torch.stack(blocks_list, dim=0)
 
-    # Compute query projection once
+    # Compute keys via normalization (over last dim)
+    K = norm_fn(V)
+
+    # Compute attention logits: q [D] @ K [N, B, T, D] -> [N, B, T]
     q = proj.weight.squeeze()  # [D]
+    logits = torch.einsum('d, n b t d -> n b t', q, K)
 
-    # Process blocks: compute attention scores incrementally to avoid large intermediates
-    h = torch.zeros(bsz, seq_len, dim, dtype=block_storage.dtype, device=block_storage.device)
-    attn_weights = torch.zeros(num_blocks, dtype=block_storage.dtype, device=block_storage.device)
-
-    # Compute scores for completed blocks (vectorized across blocks)
-    K_blocks = F.rms_norm(block_storage[:block_ptr], (block_storage.size(-1),))
-    # Dot product: q [D] @ K_blocks [block_ptr, B, T, D] -> [block_ptr, B, T]
-    # Average over B and T to get per-block scores
-    block_scores = (q * K_blocks).sum(dim=-1).mean(dim=(1, 2))  # [block_ptr]
-    attn_weights[:block_ptr] = block_scores
-
-    # Compute scores for partial block if exists
-    if partial_block is not None:
-        K_partial = F.rms_norm(partial_block, (partial_block.size(-1),))
-        partial_score = (q * K_partial).sum(dim=-1).mean()  # Average over B, T
-        attn_weights[block_ptr] = partial_score
-
-    # Softmax and aggregate
-    attn_weights = torch.softmax(attn_weights, dim=0)
-
-    # Weighted sum of blocks
-    for i in range(block_ptr):
-        h = h + attn_weights[i] * block_storage[i].expand(bsz, seq_len, dim)
-
-    if partial_block is not None:
-        h = h + attn_weights[block_ptr] * partial_block
+    # Softmax over block dimension and aggregate
+    attn_weights = torch.softmax(logits, dim=0)
+    h = torch.einsum('n b t, n b t d -> b t d', attn_weights, V)
 
     return h
 
