@@ -828,7 +828,8 @@ class GPT(nn.Module):
         bsz, seq_len, dim = x.shape
 
         # Create working block_storage from registered buffer (don't reassign the buffer)
-        block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous().clone()
+        # Clone first to break the connection to the registered buffer, then expand
+        block_storage = self.block_storage.clone().expand(-1, bsz, seq_len, dim).contiguous()
         # Initialize: embedding is the first completed block (spec: blocks includes embedding)
         # This aligns with block_attn_res expecting block_storage to have at least one block
         block_storage[0] = x  # Store normalized embedding as block 0
