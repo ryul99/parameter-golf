@@ -521,32 +521,43 @@ def block_attn_res(
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    # Concatenate completed blocks with current partial block
-    # block_storage[:block_ptr] has shape [block_ptr, 1, 1, D], need to expand to [block_ptr, B, T, D]
-    if block_ptr > 0:
-        if partial_block is not None:
-            bsz, seq_len, dim = partial_block.shape
-            completed_blocks = block_storage[:block_ptr].expand(-1, bsz, seq_len, dim)
-            V = torch.cat([completed_blocks, partial_block.unsqueeze(0)], dim=0)
-        else:
-            # Only completed blocks, no partial_block yet (fresh block start)
-            # Return first completed block as default (spec: return aggregated attention over blocks)
-            V = block_storage[:block_ptr]
-        # Normalize over feature dimension (last dim)
-        # F.rms_norm normalizes over the entire tensor, keeping the last dim size
-        K = F.rms_norm(V, (V.size(-1),))
-        logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
-        h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
-        return h
-    else:
-        # No completed blocks yet - this shouldn't happen in normal flow
-        # because block_storage[0] is always initialized with the embedding.
-        # Returning partial_block provides a safe fallback for edge cases.
-        if partial_block is not None:
-            return partial_block
-        # This shouldn't happen in normal flow (layer 0 always has embedding as partial_block)
-        # But provide a safe fallback
-        return torch.zeros_like(block_storage[0])
+    if block_ptr == 0:
+        # No completed blocks yet - fallback
+        return partial_block if partial_block is not None else torch.zeros_like(block_storage[0])
+
+    bsz, seq_len, dim = partial_block.shape if partial_block is not None else block_storage.shape[1:]
+    num_blocks = block_ptr + (1 if partial_block is not None else 0)
+
+    # Compute query projection once
+    q = proj.weight.squeeze()  # [D]
+
+    # Process blocks: compute attention scores incrementally to avoid large intermediates
+    h = torch.zeros(bsz, seq_len, dim, dtype=block_storage.dtype, device=block_storage.device)
+    attn_weights = torch.zeros(num_blocks, dtype=block_storage.dtype, device=block_storage.device)
+
+    # Compute scores for completed blocks (vectorized across blocks)
+    K_blocks = F.rms_norm(block_storage[:block_ptr], (block_storage.size(-1),))
+    # Dot product: q [D] @ K_blocks [block_ptr, 1, 1, D] -> [block_ptr, 1, 1]
+    block_scores = (q * K_blocks).sum(dim=-1).squeeze(-1).squeeze(-1)  # [block_ptr]
+    attn_weights[:block_ptr] = block_scores
+
+    # Compute scores for partial block if exists
+    if partial_block is not None:
+        K_partial = F.rms_norm(partial_block, (partial_block.size(-1),))
+        partial_score = (q * K_partial).sum(dim=-1).mean()  # Average over B, T
+        attn_weights[block_ptr] = partial_score
+
+    # Softmax and aggregate
+    attn_weights = torch.softmax(attn_weights, dim=0)
+
+    # Weighted sum of blocks
+    for i in range(block_ptr):
+        h = h + attn_weights[i] * block_storage[i].expand(bsz, seq_len, dim)
+
+    if partial_block is not None:
+        h = h + attn_weights[block_ptr] * partial_block
+
+    return h
 
 
 # -----------------------------
@@ -737,9 +748,11 @@ class Block(nn.Module):
         # This matches the spec order: apply block_attn_res first, then check boundary.
         # At block boundaries, store the completed block from previous accumulation and reset.
         if is_block_start:
-            # Clone partial_block to avoid in-place modification issues with torch.compile
-            block_storage = block_storage.clone()  # Clone entire storage to avoid grad issues
-            block_storage[block_ptr] = partial_block.clone()  # Clone to avoid grad issues
+            # Use detach().clone() for partial_block to break gradient history
+            # Use copy_() in-place on block_storage slot to avoid cloning entire tensor
+            # Aggregate partial_block: [B, T, D] -> [1, 1, D] by averaging over batch and seq
+            block_repr = partial_block.detach().mean(dim=(0, 1), keepdim=True).unsqueeze(0)  # [1, 1, 1, D]
+            block_storage[block_ptr].copy_(block_repr)
             block_ptr += 1
             partial_block = None
 
@@ -829,14 +842,13 @@ class GPT(nn.Module):
         # Initialize Block AttnRes state
         bsz, seq_len, dim = x.shape
 
-        # Create working block_storage from registered buffer (don't reassign the buffer)
-        # Clone first to break the connection to the registered buffer, then expand
-        block_storage = self.block_storage.clone().expand(-1, bsz, seq_len, dim).contiguous()
+        # Create working block_storage from registered buffer
+        # Use detach() to break gradient connection, then expand (expand creates a view, no copy)
+        block_storage = self.block_storage.detach().expand(-1, bsz, seq_len, dim).contiguous()
         # Initialize: embedding is the first completed block (spec: blocks includes embedding)
-        # This aligns with block_attn_res expecting block_storage to have at least one block
-        # Use index_copy_ to avoid in-place modification issues with torch.compile
-        block_storage = block_storage.clone()  # Extra clone to avoid in-place grad issues
-        block_storage[0] = x.clone()  # Store normalized embedding as block 0 (clone to avoid grad issues)
+        # Aggregate embedding: [B, T, D] -> [1, 1, 1, D] by averaging
+        block_repr = x.detach().mean(dim=(0, 1), keepdim=True).unsqueeze(0)  # [1, 1, 1, D]
+        block_storage[0].copy_(block_repr)
         block_ptr = 1  # Number of completed blocks in storage
         partial_block: Tensor | None = None  # Start fresh block at layer 0
 
