@@ -6,6 +6,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 """
 from __future__ import annotations
 
+import dataclasses
 import glob
 import json
 import math
@@ -81,6 +82,10 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
+    # Block AttnRes (enabled by default)
+    num_attnres_blocks: int = int(os.environ.get("NUM_ATTNRES_BLOCKS", "8"))
+    attnres_q_init_std: float = float(os.environ.get("ATTNRES_Q_INIT_STD", "0.02"))
+
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -124,7 +129,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_res_q,mlp_res_q",
     ).split(",")
     if pattern
 )
@@ -274,6 +279,55 @@ class TokenLoader:
 
 
 # ==============================================================================
+# BLOCK ATTENTION RESIDUALS
+# ==============================================================================
+
+@dataclasses.dataclass
+class AttnResContext:
+    """Context for Block Attention Residuals tracking."""
+    blocks_reps: list[mx.array]
+    partial_block: mx.array | None
+    is_block_boundary: bool
+
+
+def block_attn_res(
+    blocks_reps: list[mx.array],
+    partial_block: mx.array,
+    query_vec: mx.array,
+    norm_fn: Callable[[mx.array], mx.array],
+) -> mx.array:
+    """
+    Apply attention over block-level representations.
+
+    Args:
+        blocks_reps: N tensors of shape [B, T, D] - completed block representations
+        partial_block: [B, T, D] - intra-block partial sum
+        query_vec: [D] - learned pseudo-query vector
+        norm_fn: normalization function (e.g., rms_norm)
+
+    Returns:
+        [B, T, D] - attention-computed hidden state
+    """
+    # Stack all representations: [N+1, B, T, D]
+    V = mx.stack(blocks_reps + [partial_block], axis=0)
+
+    # Normalize keys: [N+1, B, T, D]
+    K = norm_fn(V)
+
+    # Compute logits: query_vec @ K -> [N+1, B, T]
+    # query_vec: [D], K: [N+1, B, T, D] -> contract over D
+    logits = mx.sum(query_vec[None, None, None, :] * K, axis=-1)
+
+    # Softmax over block dimension: [N+1, B, T]
+    weights = mx.softmax(logits, axis=0)
+
+    # Weighted sum: [N+1, B, T, D] -> [B, T, D]
+    h = mx.sum(weights[:, :, :, None] * V, axis=0)
+
+    return h
+
+
+# ==============================================================================
 # MODEL BLOCKS
 # ==============================================================================
 
@@ -360,6 +414,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attnres_q_init_std: float = 0.02,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
@@ -369,14 +424,65 @@ class Block(nn.Module):
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        # Block AttnRes query vectors (for inter-block attention)
+        self.attn_res_q = mx.random.normal((dim,), dtype=mx.float32) * qk_gain_init
+        self.mlp_res_q = mx.random.normal((dim,), dtype=mx.float32) * qk_gain_init
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        x0: mx.array,
+        attnres_ctx: AttnResContext | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """
+        Forward pass with optional Block Attention Residuals.
+
+        Args:
+            x: Current hidden state [B, T, D]
+            x0: Original input (for residual mixing) [B, T, D]
+            attnres_ctx: AttnResContext if Block AttnRes is enabled
+
+        Returns:
+            (output, partial_block) where:
+            - output: Result after this layer [B, T, D]
+            - partial_block: Accumulated state within current block [B, T, D]
+        """
+        # Initialize or use partial_block
+        partial_block = attnres_ctx.partial_block if attnres_ctx else None
+        if partial_block is None:
+            partial_block = x
+
+        # Standard residual mixing
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+
+        # === Block AttnRes before attention ===
+        if attnres_ctx is not None and len(attnres_ctx.blocks_reps) > 0:
+            h = block_attn_res(attnres_ctx.blocks_reps, partial_block, self.attn_res_q, rms_norm)
+        else:
+            h = x
+
+        # Self-attention with residual
+        attn_out = self.attn(self.attn_norm(h))
+        partial_block = partial_block + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+
+        # === Block AttnRes before MLP ===
+        if attnres_ctx is not None and len(attnres_ctx.blocks_reps) > 0:
+            h = block_attn_res(attnres_ctx.blocks_reps, partial_block, self.mlp_res_q, rms_norm)
+        else:
+            h = partial_block
+
+        # MLP with residual
+        mlp_out = self.mlp(self.mlp_norm(h))
+        partial_block = partial_block + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
+
+        # Handle block boundary: finalize current block and start new one
+        if attnres_ctx is not None and attnres_ctx.is_block_boundary:
+            attnres_ctx.blocks_reps.append(partial_block)
+            partial_block = None
+
+        # Return both x (for skip connections) and partial_block (for next layer)
+        return x, partial_block
 
 
 class GPT(nn.Module):
@@ -386,7 +492,9 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float,
+                 num_attnres_blocks: int = 8,
+                 attnres_q_init_std: float = 0.02):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -398,11 +506,30 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+
+        # Block AttnRes configuration
+        self.num_attnres_blocks = num_attnres_blocks
+        self.block_boundaries = self._compute_block_boundaries(num_layers, num_attnres_blocks)
+
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, attnres_q_init_std)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+
+    @staticmethod
+    def _compute_block_boundaries(num_layers: int, num_blocks: int) -> set[int]:
+        """Compute which layer indices end each block."""
+        if num_blocks <= 1:
+            return set()
+        layers_per_block = num_layers / num_blocks
+        boundaries = set()
+        cumulative = 0.0
+        for _ in range(num_blocks - 1):  # Last block extends to end
+            cumulative += layers_per_block
+            boundaries.add(int(round(cumulative)))
+        # Ensure boundaries don't exceed num_layers
+        return {b for b in boundaries if b < num_layers}
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -418,18 +545,37 @@ class GPT(nn.Module):
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
+
+        # Initialize Block AttnRes context
+        if self.num_attnres_blocks > 1:
+            attnres_ctx = AttnResContext(
+                blocks_reps=[x],  # Token embedding is first block representation
+                partial_block=None,
+                is_block_boundary=False,
+            )
+        else:
+            attnres_ctx = None  # Disable AttnRes for single block or zero
+
         skips: list[mx.array] = []
 
+        # Encoder phase: accumulate skip connections
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            is_boundary = (i + 1) in self.block_boundaries
+            if attnres_ctx:
+                attnres_ctx.is_block_boundary = is_boundary
+            x, _ = self.blocks[i](x, x0, attnres_ctx)
             skips.append(x)
+
+        # Decoder phase: consume skip connections
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            is_boundary = (layer_idx + 1) in self.block_boundaries
+            if attnres_ctx:
+                attnres_ctx.is_block_boundary = is_boundary
+            x, _ = self.blocks[layer_idx](x, x0, attnres_ctx)
+
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -897,6 +1043,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        num_attnres_blocks=args.num_attnres_blocks,
+        attnres_q_init_std=args.attnres_q_init_std,
     )
     opt = SplitOptimizers(model, args)
 
@@ -936,6 +1084,14 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    if args.num_attnres_blocks > 1:
+        log(
+            f"attnres:enabled blocks={args.num_attnres_blocks} "
+            f"boundaries={sorted(model.block_boundaries)} "
+            f"q_init_std={args.attnres_q_init_std}"
+        )
+    else:
+        log(f"attnres:disabled (num_attnres_blocks={args.num_attnres_blocks})")
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
