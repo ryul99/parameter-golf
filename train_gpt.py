@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -292,7 +293,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,attn_res_proj,mlp_res_proj",
+        "q_gain,skip_weight,skip_weights,attn_res_proj,mlp_res_proj",
     ).split(",")
     if pattern
 )
@@ -502,7 +503,7 @@ class DistributedTokenLoader:
 
 def block_attn_res(
     blocks: list[Tensor],
-    partial_block: Tensor,
+    partial_block: Tensor | None,
     proj: nn.Linear,
     norm_fn: Callable[[Tensor], Tensor],
 ) -> Tensor:
@@ -511,32 +512,17 @@ def block_attn_res(
 
     Args:
         blocks: N tensors of shape [B, T, D] - completed block representations
-        partial_block: [B, T, D] - intra-block partial sum
+        partial_block: [B, T, D] or None - intra-block partial sum
         proj: Linear projection layer for query
         norm_fn: normalization function (e.g., RMSNorm)
 
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    if not blocks:
-        # If no blocks yet, just use the partial block
-        return partial_block
-
-    # Stack all blocks + partial: [N+1, B, T, D]
-    V = torch.stack(blocks + [partial_block], dim=0)
-
-    # Normalize keys: [N+1, B, T, D]
+    V = torch.stack(blocks + ([partial_block] if partial_block is not None else []), dim=0)
     K = norm_fn(V)
-
-    # Compute logits: proj.weight @ K -> [N+1, B, T]
     logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
-
-    # Softmax over block dimension: [N+1, B, T]
-    weights = torch.softmax(logits, dim=0)
-
-    # Weighted sum: [N+1, B, T, D] -> [B, T, D]
-    h = torch.einsum('n b t, n b t d -> b t d', weights, V)
-
+    h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
     return h
 
 
@@ -682,8 +668,6 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         # Block AttnRes projections for attending over block representations
         # Initialized with smaller std dev as these are learned query vectors
         self.attn_res_proj = CastedLinear(dim, 1, bias=False)
@@ -698,14 +682,14 @@ class Block(nn.Module):
     def forward(
         self,
         blocks: list[Tensor],
-        partial_block: Tensor,
-    ) -> tuple[list[Tensor], Tensor]:
+        partial_block: Tensor | None,
+    ) -> tuple[list[Tensor], Tensor | None]:
         """
         Forward pass with Block Attention Residuals.
 
         Args:
             blocks: list of [B, T, D] tensors from previous completed blocks
-            partial_block: [B, T, D] - current intra-block partial sum
+            partial_block: [B, T, D] or None - current intra-block partial sum
 
         Returns:
             blocks: updated list of block representations
@@ -718,18 +702,18 @@ class Block(nn.Module):
         # block_size counts ATTN + MLP; each transformer layer has 2
         if self.layer_idx % (self.block_size // 2) == 0:
             blocks.append(partial_block)
-            partial_block = torch.zeros_like(partial_block)
+            partial_block = None
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
-        partial_block = partial_block + self.attn_scale.to(dtype=partial_block.dtype)[None, None, :] * attn_out
+        partial_block = (partial_block + attn_out) if partial_block is not None else attn_out
 
         # === Block AttnRes before MLP ===
         h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
-        partial_block = partial_block + self.mlp_scale.to(dtype=partial_block.dtype)[None, None, :] * mlp_out
+        partial_block = (partial_block + mlp_out) if partial_block is not None else mlp_out
 
         return blocks, partial_block
 
@@ -792,8 +776,9 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
 
         # Initialize Block AttnRes state
-        blocks: list[Tensor] = [x]  # Start with token embedding as first block
-        partial_block = torch.zeros_like(x)
+        # Token embedding is passed as first partial_block, not in blocks list
+        blocks: list[Tensor] = []
+        partial_block: Tensor | None = x
 
         # Process all layers
         for block in self.blocks:
