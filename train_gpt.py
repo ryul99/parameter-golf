@@ -749,9 +749,11 @@ class Block(nn.Module):
         # This matches the spec order: apply block_attn_res first, then check boundary.
         # At block boundaries, store the completed block from previous accumulation and reset.
         if is_block_start:
-            # Store partial_block representation in block_storage
-            # Clone partial_block to break gradient connection and avoid in-place issues
-            block_storage[block_ptr] = partial_block.detach().clone()
+            # Clone entire block_storage to create a new tensor that's not part of the computation graph
+            # This is necessary to avoid in-place modification errors with autograd
+            block_storage = block_storage.clone()
+            # Store the completed block
+            block_storage[block_ptr] = partial_block.clone()
             block_ptr += 1
             partial_block = None
 
