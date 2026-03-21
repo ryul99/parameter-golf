@@ -748,11 +748,12 @@ class Block(nn.Module):
         # This matches the spec order: apply block_attn_res first, then check boundary.
         # At block boundaries, store the completed block from previous accumulation and reset.
         if is_block_start:
-            # Use detach().clone() for partial_block to break gradient history
-            # Use copy_() in-place on block_storage slot to avoid cloning entire tensor
-            # Aggregate partial_block: [B, T, D] -> [1, 1, D] by averaging over batch and seq
-            block_repr = partial_block.detach().mean(dim=(0, 1), keepdim=True).unsqueeze(0)  # [1, 1, 1, D]
-            block_storage[block_ptr].copy_(block_repr)
+            # Aggregate partial_block: [B, T, D] -> [1, 1, D] by averaging
+            block_repr = partial_block.detach().mean(dim=(0, 1), keepdim=True)  # [1, 1, D]
+            # Expand to match slot shape [B, T, D] for in-place update
+            block_repr_expanded = block_repr.expand(bsz, seq_len, -1)
+            # Update only the specific slot using slice assignment
+            block_storage[block_ptr] = block_repr_expanded
             block_ptr += 1
             partial_block = None
 
@@ -846,9 +847,9 @@ class GPT(nn.Module):
         # Use detach() to break gradient connection, then expand (expand creates a view, no copy)
         block_storage = self.block_storage.detach().expand(-1, bsz, seq_len, dim).contiguous()
         # Initialize: embedding is the first completed block (spec: blocks includes embedding)
-        # Aggregate embedding: [B, T, D] -> [1, 1, 1, D] by averaging
-        block_repr = x.detach().mean(dim=(0, 1), keepdim=True).unsqueeze(0)  # [1, 1, 1, D]
-        block_storage[0].copy_(block_repr)
+        # Aggregate embedding: [B, T, D] -> [1, 1, D] by averaging, then expand to slot shape
+        block_repr = x.detach().mean(dim=(0, 1), keepdim=True)  # [1, 1, D]
+        block_storage[0] = block_repr.expand(bsz, seq_len, -1)  # Expand to [B, T, D] and assign
         block_ptr = 1  # Number of completed blocks in storage
         partial_block: Tensor | None = None  # Start fresh block at layer 0
 
