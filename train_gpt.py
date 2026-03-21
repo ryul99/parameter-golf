@@ -831,7 +831,10 @@ class GPT(nn.Module):
         # Create working block_storage from registered buffer
         # Clone to create independent tensor, then expand to match input dimensions
         block_storage = self.block_storage.clone().expand(-1, bsz, seq_len, dim).contiguous()
-        block_ptr = 0  # Start with no completed blocks (layer 0 boundary will store embedding)
+        # NOTE: Per spec, embedding should be stored as block 0 before layer loop starts.
+        # Current implementation stores it at layer 0 boundary, which means first
+        # block_attn_res call returns embedding directly without attending over any blocks.
+        block_ptr = 0
 
         # Process all layers
         for block in self.blocks:
