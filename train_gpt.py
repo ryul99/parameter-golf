@@ -525,10 +525,10 @@ def block_attn_res(
         # No completed blocks yet - use projection weights to scale partial_block
         if partial_block is not None:
             # Normalize and apply learned scaling via projection weights
-            h = norm_fn(partial_block)
-            # proj.weight is [1, D], h is [B, T, D]
+            h_norm = norm_fn(partial_block)
+            # proj.weight is [1, D], h_norm is [B, T, D]
             # Use element-wise multiplication followed by sum over D to get scalar scaling
-            scaling = (h * proj.weight.unsqueeze(0).unsqueeze(0)).sum(dim=-1, keepdim=True)  # [B, T, 1]
+            scaling = (h_norm * proj.weight.unsqueeze(0).unsqueeze(0)).sum(dim=-1, keepdim=True)  # [B, T, 1]
             return partial_block * scaling
         else:
             return torch.zeros_like(block_storage[0])
@@ -551,7 +551,7 @@ def block_attn_res(
     attn_weights = torch.softmax(logits, dim=0)
     h = torch.einsum('n b t, n b t d -> b t d', attn_weights, V)
 
-    return h
+    return h.contiguous()
 
 
 # -----------------------------
@@ -742,10 +742,9 @@ class Block(nn.Module):
         # === Check block boundary AFTER AttnRes ===
         # This matches the spec order: apply block_attn_res first, then check boundary.
         if is_block_start:
-            # Store the completed block - use copy_ to maintain gradient flow
-            # We need to create a detached clone first to avoid in-place modification
-            detached_block = partial_block.detach().clone()
-            block_storage[block_ptr].copy_(detached_block)
+            # Store the completed block - must clone to avoid memory sharing
+            # Don't use copy_ on the storage tensor as it creates references
+            block_storage[block_ptr] = partial_block.detach().clone()
             block_ptr += 1
             partial_block = None
 
