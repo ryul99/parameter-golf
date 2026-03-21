@@ -505,28 +505,25 @@ class DistributedTokenLoader:
 def block_attn_res(
     block_storage: Tensor,
     block_ptr: int,
-    partial_block: Tensor | None,
+    partial_block: Tensor,
     proj: nn.Linear,
     norm_fn: Callable[[Tensor], Tensor],
 ) -> Tensor:
     """
-    Inter-block attention: attend over block reps + optional partial sum.
+    Inter-block attention: attend over block reps + partial sum.
 
     Args:
         block_storage: [max_blocks, B, T, D] - pre-allocated tensor for block representations
         block_ptr: int - number of active blocks in storage
-        partial_block: [B, T, D] or None - intra-block partial sum (None at block starts)
+        partial_block: [B, T, D] - intra-block partial sum
         proj: Linear projection layer for query
         norm_fn: normalization function (e.g., RMSNorm)
 
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    # Collect all active representations
-    if partial_block is not None:
-        V = torch.cat([block_storage[:block_ptr], partial_block.unsqueeze(0)], dim=0)
-    else:
-        V = block_storage[:block_ptr]
+    # Concatenate completed blocks with current partial block
+    V = torch.cat([block_storage[:block_ptr], partial_block.unsqueeze(0)], dim=0)
 
     K = norm_fn(V)
     logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
@@ -691,8 +688,8 @@ class Block(nn.Module):
         self,
         block_storage: Tensor,
         block_ptr: int,
-        partial_block: Tensor | None,
-    ) -> tuple[int, Tensor | None]:
+        partial_block: Tensor,
+    ) -> tuple[int, Tensor]:
         """
         Forward pass with Block Attention Residuals.
 
@@ -705,33 +702,29 @@ class Block(nn.Module):
             block_ptr: updated number of active blocks
             partial_block: updated intra-block partial sum
         """
-        # Check if we're at the END of a block
-        # block_size counts ATTN + MLP; each transformer layer has 2
         layers_per_block = self.block_size // 2
-        if self.layer_idx > 0 and self.layer_idx % layers_per_block == 0:
-            # At block boundary: store completed block and reset
-            block_storage[block_ptr] = partial_block
-            block_ptr += 1
-            partial_block = None
 
-        # If partial_block is None (start of a block), we need to initialize it
-        # by using the output from block_attn_res with only block_storage
-        if partial_block is None:
-            # Block AttnRes with only completed blocks (no intra-block partial yet)
-            V = block_storage[:block_ptr]
-            K = self.attn_norm(V)
-            logits = torch.einsum('d, n b t d -> n b t', self.attn_res_proj.weight.squeeze(), K)
-            h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
-        else:
-            # === Block AttnRes before attention ===
-            h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
+        # === Block AttnRes before attention ===
+        h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
-        partial_block = partial_block + attn_out if partial_block is not None else attn_out
+        partial_block = partial_block + attn_out
 
-        # === Block AttnRes before MLP ===
-        h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
+        # === Check block boundary AFTER attention, before MLP ===
+        # (layer_idx + 1) because we've just completed layer_idx's attention
+        if (self.layer_idx + 1) % layers_per_block == 0:
+            # At block boundary: store completed block
+            block_storage[block_ptr] = partial_block
+            block_ptr += 1
+            # Compute new h from block storage for MLP (includes newly stored block)
+            V = block_storage[:block_ptr]
+            K = self.mlp_norm(V)
+            logits = torch.einsum('d, n b t d -> n b t', self.mlp_res_proj.weight.squeeze(), K)
+            h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
+        else:
+            # Normal intra-block flow
+            h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
@@ -819,15 +812,13 @@ class GPT(nn.Module):
         # Store normalized embedding as the first block representation
         block_storage[0] = x
         block_ptr = 1  # Next block slot to use
-        partial_block: Tensor | None = None  # Will be initialized at layer 0
+        partial_block: Tensor = x  # Initialize with normalized embedding
 
         # Process all layers
         for block in self.blocks:
             block_ptr, partial_block = block(block_storage, block_ptr, partial_block)
 
-        # Use final partial_block as the output (should not be None at the end)
-        if partial_block is None:
-            raise RuntimeError("partial_block is None at end of forward pass")
+        # Use final partial_block as the output
         x = partial_block
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
