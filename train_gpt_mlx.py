@@ -81,8 +81,7 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Block AttnRes.
-    num_attnres_blocks: int = int(os.environ.get("NUM_ATTNRES_BLOCKS", "8"))
+    # Full AttnRes.
     attnres_q_init_std: float = float(os.environ.get("ATTNRES_Q_INIT_STD", "0.02"))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
@@ -128,7 +127,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,attn_res_q,mlp_res_q",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,attn_res_q",
     ).split(",")
     if pattern
 )
@@ -278,68 +277,48 @@ class TokenLoader:
 
 
 # ==============================================================================
-# BLOCK ATTENTION RESIDUALS
+# FULL ATTENTION RESIDUALS
 # ==============================================================================
 
-def block_attn_res(
-    blocks_reps: mx.array,
-    partial_block: mx.array,
+def attn_res(
+    prev_layers: list[mx.array],
     query_vec: mx.array,
     norm_fn: Callable[[mx.array], mx.array],
-    num_valid_blocks: int,
 ) -> mx.array:
     """
-    Apply attention over block-level representations.
+    Apply attention over all previous layer outputs.
 
-    This implements Block Attention Residuals (Block AttnRes) which allows each
-    layer to selectively attend over previous block representations using a learned
-    pseudo-query vector.
+    This implements Full Attention Residuals (AttnRes) which allows each
+    layer to selectively attend over all previous layer representations using
+    a learned pseudo-query vector.
 
     Args:
-        blocks_reps: [Nmax, B, T, D] fixed-size tensor buffer of completed blocks
-        partial_block: [B, T, D] - intra-block partial sum
+        prev_layers: list of [B, T, D] tensors from previous layers
         query_vec: [D] - learned pseudo-query vector
         norm_fn: normalization function (e.g., rms_norm)
-        num_valid_blocks: Number of valid entries in blocks_reps
 
     Returns:
         [B, T, D] - attention-computed hidden state
-
-    Note:
-        The reference pseudocode uses a Linear projection layer (proj.weight) to
-        generate queries, but this implementation directly uses learned query vectors
-        for simplicity. The functional behavior is equivalent: a learned vector
-        that computes attention weights over the normalized block representations.
     """
-    # Only use completed block reps plus the current partial block, matching
-    # attention_residuals.md: h = attn(completed_blocks + [partial_block]).
-    V = mx.concatenate((blocks_reps[:num_valid_blocks], partial_block[None, :, :, :]), axis=0)
+    if not prev_layers:
+        raise ValueError("prev_layers cannot be empty")
 
-    # Normalize keys: [N+1, B, T, D]
+    # Stack all previous layers: [N, B, T, D]
+    V = mx.stack(prev_layers, axis=0)
+
+    # Normalize keys: [N, B, T, D]
     K = norm_fn(V)
 
-    # Compute logits: query_vec @ K -> [N+1, B, T]
-    # query_vec: [D], K: [N+1, B, T, D] -> contract over D
+    # Compute logits: query_vec @ K -> [N, B, T]
     logits = mx.sum(query_vec[None, None, None, :] * K, axis=-1)
 
-    # Softmax over block dimension: [N+1, B, T]
+    # Softmax over layer dimension: [N, B, T]
     weights = mx.softmax(logits, axis=0)
 
-    # Weighted sum: [N+1, B, T, D] -> [B, T, D]
+    # Weighted sum: [N, B, T, D] -> [B, T, D]
     h = mx.sum(weights[:, :, :, None] * V, axis=0)
 
     return h
-
-
-def replace_block_rep(blocks_reps: mx.array, block_idx: int, block_rep: mx.array) -> mx.array:
-    return mx.concatenate(
-        (
-            blocks_reps[:block_idx],
-            block_rep[None, :, :, :],
-            blocks_reps[block_idx + 1 :],
-        ),
-        axis=0,
-    )
 
 
 # ==============================================================================
@@ -438,57 +417,40 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        # Block AttnRes query vectors (for inter-block attention)
-        # Initialized with smaller std dev as these are learned pseudo-query vectors
+        # Full AttnRes query vector (for attending over all previous layers)
+        # Initialized with smaller std dev as this is a learned pseudo-query vector
         self.attn_res_q = mx.random.normal((dim,), dtype=mx.float32) * attnres_q_init_std
-        self.mlp_res_q = mx.random.normal((dim,), dtype=mx.float32) * attnres_q_init_std
 
     def __call__(
         self,
         x: mx.array,
-        blocks_reps: mx.array,
-        num_valid_blocks: int = 0,
-        is_block_boundary: bool = False,
-    ) -> tuple[mx.array, mx.array, int]:
+        prev_layers: list[mx.array],
+    ) -> mx.array:
         """
-        Forward pass with Block Attention Residuals.
+        Forward pass with Full Attention Residuals.
 
         Args:
             x: Current hidden state [B, T, D]
-            blocks_reps: [Nmax, B, T, D] tensor buffer of completed block reps
-            num_valid_blocks: Number of valid entries in blocks_reps
-            is_block_boundary: Whether entering this layer finalizes the previous block
+            prev_layers: list of [B, T, D] tensors from all previous layers
 
         Returns:
-            (output, blocks_reps, num_valid_blocks) where:
-            - output: Result after this layer [B, T, D]
+            output: Result after this layer [B, T, D]
         """
-        partial_block = x
-
-        # === Block AttnRes before attention ===
-        h = block_attn_res(blocks_reps, partial_block, self.attn_res_q, rms_norm, num_valid_blocks)
-
-        # Match the reference pseudocode: boundary layers first finalize the
-        # previous block memory, then start a new block for the current layer.
-        partial_for_attn = partial_block
-        if is_block_boundary:
-            blocks_reps = replace_block_rep(blocks_reps, num_valid_blocks, partial_block)
-            num_valid_blocks += 1
-            partial_for_attn = None
+        # === Full AttnRes before attention ===
+        h = attn_res(prev_layers, self.attn_res_q, rms_norm)
 
         # Self-attention with residual
         attn_out = self.attn(self.attn_norm(h))
-        scaled_attn = self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        partial_block = partial_for_attn + scaled_attn if partial_for_attn is not None else scaled_attn
+        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
 
-        # === Block AttnRes before MLP ===
-        h = block_attn_res(blocks_reps, partial_block, self.mlp_res_q, rms_norm, num_valid_blocks)
+        # === Full AttnRes before MLP ===
+        h = attn_res(prev_layers + [x], self.attn_res_q, rms_norm)
 
         # MLP with residual
         mlp_out = self.mlp(self.mlp_norm(h))
-        partial_block = partial_block + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
 
-        return partial_block, blocks_reps, num_valid_blocks
+        return x
 
 
 class GPT(nn.Module):
@@ -499,27 +461,18 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float,
-                 num_attnres_blocks: int = 8,
                  attnres_q_init_std: float = 0.02):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
-        if num_attnres_blocks < 1:
-            raise ValueError(f"num_attnres_blocks must be >= 1, got {num_attnres_blocks}")
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-
-        # Block AttnRes configuration
-        # block_boundaries contains layer indices where new blocks start
-        # e.g., {1, 2, 3, 4, 6, 7, 8} means layers 1,2,3,4,6,7,8 each start a new block
-        self.num_attnres_blocks = num_attnres_blocks
-        self.block_boundaries = self._compute_block_boundaries(num_layers, num_attnres_blocks)
 
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, attnres_q_init_std)
@@ -535,41 +488,6 @@ class GPT(nn.Module):
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
 
-    @staticmethod
-    def _compute_block_boundaries(num_layers: int, num_blocks: int) -> set[int]:
-        """Compute which layer indices are block boundaries.
-
-        A block boundary at layer index i means: when we ENTER layer i, we finalize
-        the previous block's accumulated representation and start a new block.
-
-        Following the reference pseudocode in attention_residuals.md, block boundaries
-        are determined based on sub-layer count (each transformer layer has 2 sub-layers:
-        ATTN and MLP). We partition num_layers * 2 sub-layers into num_blocks.
-
-        For example, with 9 layers and 8 blocks:
-        - 18 sub-layers / 8 blocks = 2.25 sub-layers per block
-        - Cumulative sub-layers: 2.25, 4.5, 6.75, 9, 11.25, 13.5, 15.75
-        - Converted to layers: 1.125, 2.25, 3.375, 4.5, 5.625, 6.75, 7.875
-        - Rounded to layer boundaries: {1, 2, 3, 4, 6, 7, 8}
-        - After filtering (< num_layers): {1, 2, 3, 4, 6, 7, 8}
-
-        This creates blocks with varying sizes (some with 1 layer, some with 2)
-        to approximate equal computation per block.
-        """
-        if num_blocks <= 1:
-            return set()
-        num_sublayers = num_layers * 2  # Each layer has ATTN + MLP
-        sublayers_per_block = num_sublayers / num_blocks
-        boundaries = set()
-        cumulative = 0.0
-        for _ in range(num_blocks - 1):  # Last block extends to end
-            cumulative += sublayers_per_block
-            # Convert sub-layer position back to layer index
-            layer_boundary = cumulative / 2.0
-            boundaries.add(int(round(layer_boundary)))
-        # Ensure boundaries don't exceed num_layers
-        return {b for b in boundaries if b < num_layers}
-
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
@@ -577,32 +495,14 @@ class GPT(nn.Module):
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
 
-        # Initialize Block AttnRes state. Slot 0 always stores the token
-        # embedding, and each boundary finalizes one completed block into the
-        # next slot before starting a fresh partial block.
-        max_blocks = self.num_attnres_blocks + 1  # +1 for token embedding
-        blocks_reps = mx.concatenate(
-            (
-                x[None, :, :, :],
-                mx.zeros((max_blocks - 1, *x.shape), dtype=x.dtype),
-            ),
-            axis=0,
-        )
-        num_valid_blocks = 1  # Slot 0 already holds the token embedding.
-
+        # Initialize Full AttnRes state with token embedding
+        prev_layers: list[mx.array] = [x]
         skips: list[mx.array] = []
 
         # Encoder phase: accumulate skip connections
         for i in range(self.num_encoder_layers):
-            # Boundary layers finalize the previous block before applying the
-            # current layer, matching attention_residuals.md.
-            is_boundary = i in self.block_boundaries
-            x, blocks_reps, num_valid_blocks = self.blocks[i](
-                x,
-                blocks_reps,
-                num_valid_blocks,
-                is_boundary,
-            )
+            x = self.blocks[i](x, prev_layers)
+            prev_layers.append(x)
             skips.append(x)
 
         # Decoder phase: consume skip connections
@@ -610,15 +510,8 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             layer_idx = self.num_encoder_layers + i
-            # Boundary layers finalize the previous block before applying the
-            # current layer, matching attention_residuals.md.
-            is_boundary = layer_idx in self.block_boundaries
-            x, blocks_reps, num_valid_blocks = self.blocks[layer_idx](
-                x,
-                blocks_reps,
-                num_valid_blocks,
-                is_boundary,
-            )
+            x = self.blocks[layer_idx](x, prev_layers)
+            prev_layers.append(x)
 
         return self.final_norm(x)
 
@@ -1094,7 +987,6 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
-        num_attnres_blocks=args.num_attnres_blocks,
         attnres_q_init_std=args.attnres_q_init_std,
     )
     opt = SplitOptimizers(model, args)
@@ -1140,9 +1032,7 @@ def main() -> None:
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
-        f"attnres blocks={args.num_attnres_blocks} "
-        f"boundaries={sorted(model.block_boundaries)} "
-        f"q_init_std={args.attnres_q_init_std}"
+        f"attnres q_init_std={args.attnres_q_init_std}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
