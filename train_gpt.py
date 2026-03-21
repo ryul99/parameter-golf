@@ -715,17 +715,17 @@ class Block(nn.Module):
         layers_per_block = self.block_size // 2
         is_block_start = self.layer_idx % layers_per_block == 0
 
-        # === Block AttnRes before attention ===
-        # Attend over completed blocks + current partial_block (accumulated from previous block).
-        h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
-
-        # === Check block boundary AFTER AttnRes (matches spec order) ===
+        # === Check block boundary BEFORE AttnRes (matches spec order) ===
         # At block boundaries (layers 0, 2, 4, ... for block_size=4), store the completed
-        # block and reset partial_block to zeros for accumulating the next block.
+        # block from previous accumulation and reset partial_block for accumulating the next block.
         if is_block_start:
             block_storage[block_ptr] = partial_block
             block_ptr += 1
             partial_block = torch.zeros_like(partial_block)
+
+        # === Block AttnRes before attention ===
+        # Attend over completed blocks + current partial_block.
+        h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
