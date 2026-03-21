@@ -799,13 +799,14 @@ class GPT(nn.Module):
         # Pre-allocate storage for block representations
         # block_size counts ATTN+MLP, so we have one block every block_size//2 layers
         # +1 for the embedding, which serves as the first block (before layer 0 processes)
-        self.num_block_slots = num_layers // (block_size // 2) + 1
+        # Use ceiling division to ensure we have enough slots for all possible block boundaries
+        self.num_block_slots = (num_layers + block_size // 2 - 1) // (block_size // 2) + 1
         self.model_dim = model_dim
         # Register block_storage as a buffer with max size shape
         # Will be properly initialized in forward with correct batch/seq dims
         self.register_buffer(
             "block_storage",
-            torch.zeros(num_layers // (block_size // 2) + 1, 1, 1, model_dim, dtype=torch.bfloat16),
+            torch.zeros((num_layers + block_size // 2 - 1) // (block_size // 2) + 1, 1, 1, model_dim, dtype=torch.bfloat16),
             persistent=False,
         )
 
