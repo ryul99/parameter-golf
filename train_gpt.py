@@ -502,7 +502,8 @@ class DistributedTokenLoader:
 # -----------------------------
 
 def block_attn_res(
-    blocks: list[Tensor],
+    block_storage: Tensor,
+    block_ptr: int,
     partial_block: Tensor | None,
     proj: nn.Linear,
     norm_fn: Callable[[Tensor], Tensor],
@@ -511,7 +512,8 @@ def block_attn_res(
     Inter-block attention: attend over block reps + partial sum.
 
     Args:
-        blocks: N tensors of shape [B, T, D] - completed block representations
+        block_storage: [max_blocks, B, T, D] - pre-allocated tensor for block representations
+        block_ptr: int - number of active blocks in storage
         partial_block: [B, T, D] or None - intra-block partial sum
         proj: Linear projection layer for query
         norm_fn: normalization function (e.g., RMSNorm)
@@ -519,7 +521,12 @@ def block_attn_res(
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    V = torch.stack(blocks + ([partial_block] if partial_block is not None else []), dim=0)
+    # Collect all active representations
+    if partial_block is not None:
+        V = torch.cat([block_storage[:block_ptr], partial_block.unsqueeze(0)], dim=0)
+    else:
+        V = block_storage[:block_ptr]
+
     K = norm_fn(V)
     logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
     h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
@@ -681,27 +688,33 @@ class Block(nn.Module):
 
     def forward(
         self,
-        blocks: list[Tensor],
+        block_storage: Tensor,
+        block_ptr: int,
         partial_block: Tensor | None,
-    ) -> tuple[list[Tensor], Tensor | None]:
+    ) -> tuple[int, Tensor | None]:
         """
         Forward pass with Block Attention Residuals.
 
         Args:
-            blocks: list of [B, T, D] tensors from previous completed blocks
+            block_storage: [max_blocks, B, T, D] tensor for block representations
+            block_ptr: int - current number of active blocks
             partial_block: [B, T, D] or None - current intra-block partial sum
 
         Returns:
-            blocks: updated list of block representations
+            block_ptr: updated number of active blocks
             partial_block: updated intra-block partial sum
         """
         # === Block AttnRes before attention ===
-        h = block_attn_res(blocks, partial_block, self.attn_res_proj, self.attn_norm)
+        h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
         # Check if we've reached a block boundary
         # block_size counts ATTN + MLP; each transformer layer has 2
-        if self.layer_idx % (self.block_size // 2) == 0:
-            blocks.append(partial_block)
+        is_first_layer = self.layer_idx % (self.block_size // 2) == 0
+        if is_first_layer:
+            # Store the partial_block as a new completed block
+            block_storage[block_ptr] = partial_block
+            block_ptr += 1
+            # Reset partial_block for the new block
             partial_block = None
 
         # Self-attention layer
@@ -709,13 +722,13 @@ class Block(nn.Module):
         partial_block = (partial_block + attn_out) if partial_block is not None else attn_out
 
         # === Block AttnRes before MLP ===
-        h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_norm)
+        h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
         partial_block = (partial_block + mlp_out) if partial_block is not None else mlp_out
 
-        return blocks, partial_block
+        return block_ptr, partial_block
 
 
 class GPT(nn.Module):
@@ -762,6 +775,17 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+
+        # Pre-allocate storage for block representations
+        # block_size counts ATTN+MLP, so we have one block every block_size//2 layers
+        # +1 for the initial embedding storage
+        self.num_block_slots = num_layers // (block_size // 2) + 1
+        self.register_buffer(
+            "block_storage",
+            torch.zeros(self.num_block_slots, 1, 1, model_dim, dtype=torch.bfloat16),
+            persistent=False,
+        )
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -776,13 +800,19 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
 
         # Initialize Block AttnRes state
-        # Token embedding is the first completed block
-        blocks: list[Tensor] = [x]
+        bsz, seq_len, dim = x.shape
+
+        # Resize block_storage to match actual batch/sequence dimensions
+        if self.block_storage.shape[1:] != (bsz, seq_len, dim):
+            self.block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous()
+
+        block_storage = self.block_storage
+        block_ptr = 0
         partial_block: Tensor | None = None
 
         # Process all layers
         for block in self.blocks:
-            blocks, partial_block = block(blocks, partial_block)
+            block_ptr, partial_block = block(block_storage, block_ptr, partial_block)
 
         # Use final partial_block as the output
         x = partial_block
