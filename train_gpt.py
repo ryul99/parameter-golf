@@ -737,7 +737,9 @@ class Block(nn.Module):
         # This matches the spec order: apply block_attn_res first, then check boundary.
         # At block boundaries, store the completed block from previous accumulation and reset.
         if is_block_start:
-            block_storage[block_ptr] = partial_block
+            # Clone partial_block to avoid in-place modification issues with torch.compile
+            block_storage = block_storage.clone()  # Clone entire storage to avoid grad issues
+            block_storage[block_ptr] = partial_block.clone()  # Clone to avoid grad issues
             block_ptr += 1
             partial_block = None
 
@@ -832,7 +834,9 @@ class GPT(nn.Module):
         block_storage = self.block_storage.clone().expand(-1, bsz, seq_len, dim).contiguous()
         # Initialize: embedding is the first completed block (spec: blocks includes embedding)
         # This aligns with block_attn_res expecting block_storage to have at least one block
-        block_storage[0] = x  # Store normalized embedding as block 0
+        # Use index_copy_ to avoid in-place modification issues with torch.compile
+        block_storage = block_storage.clone()  # Extra clone to avoid in-place grad issues
+        block_storage[0] = x.clone()  # Store normalized embedding as block 0 (clone to avoid grad issues)
         block_ptr = 1  # Number of completed blocks in storage
         partial_block: Tensor | None = None  # Start fresh block at layer 0
 
