@@ -59,7 +59,6 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -804,11 +803,8 @@ class GPT(nn.Module):
         # Initialize Block AttnRes state
         bsz, seq_len, dim = x.shape
 
-        # Resize block_storage to match actual batch/sequence dimensions
-        if self.block_storage.shape[1:] != (bsz, seq_len, dim):
-            self.block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous()
-
-        block_storage = self.block_storage.clone()
+        # Create working block_storage from registered buffer (don't reassign the buffer)
+        block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous().clone()
         # Store normalized embedding as the first block representation
         block_storage[0] = x
         block_ptr = 1  # Next block slot to use
