@@ -539,8 +539,9 @@ def block_attn_res(
         h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
         return h
     else:
-        # No completed blocks yet, return zeros as base (layer 0 case)
-        # partial_block will be the embedding or accumulated output
+        # No completed blocks yet - this shouldn't happen in normal flow
+        # because block_storage[0] is always initialized with the embedding.
+        # Returning partial_block provides a safe fallback for edge cases.
         if partial_block is not None:
             return partial_block
         # This shouldn't happen in normal flow (layer 0 always has embedding as partial_block)
@@ -722,7 +723,10 @@ class Block(nn.Module):
         """
         layers_per_block = self.block_size // 2
         # Block boundary check: only trigger at layers 2, 4, 6, ... (NOT layer 0)
-        # Layer 0 uses embedding from previous block, doesn't start a new one
+        # Note: Unlike the spec which checks `layer_number % 2 == 0`, we exclude layer 0
+        # because the normalized embedding is already stored as block_storage[0].
+        # This treats [embedding + layer 0 + layer 1] as the first complete block,
+        # rather than storing separate blocks at layer 0 and layer 2.
         is_block_start = self.layer_idx > 0 and self.layer_idx % layers_per_block == 0
 
         # === Block AttnRes before attention ===
@@ -826,6 +830,7 @@ class GPT(nn.Module):
         # Create working block_storage from registered buffer (don't reassign the buffer)
         block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous().clone()
         # Initialize: embedding is the first completed block (spec: blocks includes embedding)
+        # This aligns with block_attn_res expecting block_storage to have at least one block
         block_storage[0] = x  # Store normalized embedding as block 0
         block_ptr = 1  # Number of completed blocks in storage
         partial_block: Tensor | None = None  # Start fresh block at layer 0
