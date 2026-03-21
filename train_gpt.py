@@ -713,18 +713,18 @@ class Block(nn.Module):
             partial_block: updated intra-block partial sum
         """
         layers_per_block = self.block_size // 2
-
-        # === Check block boundary AT START (before processing layer) ===
-        # When entering a new block (except for layer 0), store the completed block
-        if self.layer_idx > 0 and self.layer_idx % layers_per_block == 0:
-            # Store completed block and start fresh accumulation
-            block_storage[block_ptr] = partial_block
-            block_ptr += 1
-            # Reset partial_block to zeros - new block starts fresh
-            partial_block = torch.zeros_like(partial_block)
+        is_block_start = self.layer_idx > 0 and self.layer_idx % layers_per_block == 0
 
         # === Block AttnRes before attention ===
+        # Attend over the INPUT (partial_block) first, before any reset at block boundaries
         h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
+
+        # === Check block boundary AFTER attention ===
+        # Store completed block and reset for fresh accumulation
+        if is_block_start:
+            block_storage[block_ptr] = partial_block
+            block_ptr += 1
+            partial_block = torch.zeros_like(partial_block)
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
