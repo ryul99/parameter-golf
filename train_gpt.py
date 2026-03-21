@@ -721,15 +721,17 @@ class Block(nn.Module):
             partial_block: updated intra-block partial sum
         """
         layers_per_block = self.block_size // 2
-        is_block_start = self.layer_idx % layers_per_block == 0
+        # Block boundary check: only trigger at layers 2, 4, 6, ... (NOT layer 0)
+        # Layer 0 uses embedding from previous block, doesn't start a new one
+        is_block_start = self.layer_idx > 0 and self.layer_idx % layers_per_block == 0
 
         # === Block AttnRes before attention ===
         # Attend over completed blocks + current partial_block.
         h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
-        # === Check block boundary AFTER AttnRes (matches spec order) ===
-        # At block boundaries (layers 0, 2, 4, ... for block_size=4), store the completed
-        # block from previous accumulation and signal reset via None (matches spec's None).
+        # === Check block boundary AFTER AttnRes ===
+        # This matches the spec order: apply block_attn_res first, then check boundary.
+        # At block boundaries, store the completed block from previous accumulation and reset.
         if is_block_start:
             block_storage[block_ptr] = partial_block
             block_ptr += 1
@@ -797,7 +799,7 @@ class GPT(nn.Module):
 
         # Pre-allocate storage for block representations
         # block_size counts ATTN+MLP, so we have one block every block_size//2 layers
-        # +1 for the embedding stored at layer 0 (first block boundary)
+        # +1 for the embedding, which serves as the first block (before layer 0 processes)
         self.num_block_slots = num_layers // (block_size // 2) + 1
         self.register_buffer(
             "block_storage",
@@ -823,9 +825,10 @@ class GPT(nn.Module):
 
         # Create working block_storage from registered buffer (don't reassign the buffer)
         block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous().clone()
-        # Initialize: embedding starts as partial_block, will be stored at layer 0 block boundary
-        block_ptr = 0  # First block slot to use (embedding will be stored here at layer 0)
-        partial_block: Tensor | None = x  # Start accumulating from normalized embedding
+        # Initialize: embedding is the first completed block (spec: blocks includes embedding)
+        block_storage[0] = x  # Store normalized embedding as block 0
+        block_ptr = 1  # Number of completed blocks in storage
+        partial_block: Tensor | None = None  # Start fresh block at layer 0
 
         # Process all layers
         for block in self.blocks:
