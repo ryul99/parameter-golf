@@ -524,7 +524,9 @@ def block_attn_res(
     # Concatenate completed blocks with current partial block
     V = torch.cat([block_storage[:block_ptr], partial_block.unsqueeze(0)], dim=0)
 
-    K = norm_fn(V)
+    # Normalize each block independently over the feature dimension (last dim)
+    # This ensures each block's representation is normalized separately
+    K = F.rms_norm(V, (V.size(-1),), dim=-1)
     logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
     h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
     return h
