@@ -748,12 +748,9 @@ class Block(nn.Module):
         # This matches the spec order: apply block_attn_res first, then check boundary.
         # At block boundaries, store the completed block from previous accumulation and reset.
         if is_block_start:
-            # Aggregate partial_block: [B, T, D] -> [1, 1, D] by averaging
-            block_repr = partial_block.detach().mean(dim=(0, 1), keepdim=True)  # [1, 1, D]
-            # Expand to match slot shape [B, T, D] for in-place update
-            block_repr_expanded = block_repr.expand(bsz, seq_len, -1)
-            # Update only the specific slot using slice assignment
-            block_storage[block_ptr] = block_repr_expanded
+            # Store partial_block representation in block_storage
+            # Clone partial_block to break gradient connection and avoid in-place issues
+            block_storage[block_ptr] = partial_block.detach().clone()
             block_ptr += 1
             partial_block = None
 
@@ -844,12 +841,10 @@ class GPT(nn.Module):
         bsz, seq_len, dim = x.shape
 
         # Create working block_storage from registered buffer
-        # Use detach() to break gradient connection, then expand (expand creates a view, no copy)
-        block_storage = self.block_storage.detach().expand(-1, bsz, seq_len, dim).contiguous()
+        # Clone to create independent tensor, then expand to match input dimensions
+        block_storage = self.block_storage.clone().expand(-1, bsz, seq_len, dim).contiguous()
         # Initialize: embedding is the first completed block (spec: blocks includes embedding)
-        # Aggregate embedding: [B, T, D] -> [1, 1, D] by averaging, then expand to slot shape
-        block_repr = x.detach().mean(dim=(0, 1), keepdim=True)  # [1, 1, D]
-        block_storage[0] = block_repr.expand(bsz, seq_len, -1)  # Expand to [B, T, D] and assign
+        block_storage[0] = x.detach().clone()
         block_ptr = 1  # Number of completed blocks in storage
         partial_block: Tensor | None = None  # Start fresh block at layer 0
 
