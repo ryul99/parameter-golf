@@ -604,9 +604,8 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         # RMSNorm doesn't support FP8, cast to bfloat16 temporarily
-        q_dtype = q.dtype
-        q = F.rms_norm(q.to(dtype=torch.bfloat16), (q.size(-1),)).to(dtype=q_dtype)
-        k = F.rms_norm(k.to(dtype=torch.bfloat16), (k.size(-1),)).to(dtype=k_dtype)
+        q = F.rms_norm(q.to(dtype=torch.bfloat16), (q.size(-1),)).to(dtype=q.dtype)
+        k = F.rms_norm(k.to(dtype=torch.bfloat16), (k.size(-1),)).to(dtype=k.dtype)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
