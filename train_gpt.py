@@ -688,7 +688,7 @@ class Block(nn.Module):
         block_storage: Tensor,
         block_ptr: int,
         partial_block: Tensor,
-    ) -> tuple[int, Tensor]:
+    ) -> tuple[Tensor, int, Tensor]:
         """
         Forward pass with Block Attention Residuals.
 
@@ -698,6 +698,7 @@ class Block(nn.Module):
             partial_block: [B, T, D] - current intra-block partial sum
 
         Returns:
+            block_storage: updated block storage tensor
             block_ptr: updated number of active blocks
             partial_block: updated intra-block partial sum
         """
@@ -713,9 +714,11 @@ class Block(nn.Module):
         # === Check block boundary AFTER attention, before MLP ===
         # (layer_idx + 1) because we've just completed layer_idx's attention
         if (self.layer_idx + 1) % layers_per_block == 0:
-            # At block boundary: store completed block
+            # At block boundary: store completed block and start fresh accumulation
             block_storage[block_ptr] = partial_block
             block_ptr += 1
+            # Reset partial_block to start fresh accumulation for next block
+            partial_block = torch.zeros_like(partial_block)
             # Compute new h from block storage for MLP (includes newly stored block)
             V = block_storage[:block_ptr]
             K = self.mlp_norm(V)
@@ -729,7 +732,7 @@ class Block(nn.Module):
         mlp_out = self.mlp(self.mlp_norm(h))
         partial_block = partial_block + mlp_out
 
-        return block_ptr, partial_block
+        return block_storage, block_ptr, partial_block
 
 
 class GPT(nn.Module):
@@ -812,7 +815,7 @@ class GPT(nn.Module):
 
         # Process all layers
         for block in self.blocks:
-            block_ptr, partial_block = block(block_storage, block_ptr, partial_block)
+            block_storage, block_ptr, partial_block = block(block_storage, block_ptr, partial_block)
 
         # Use final partial_block as the output
         x = partial_block
