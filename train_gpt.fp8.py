@@ -514,6 +514,12 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
+        # RMSNorm doesn't support FP8, so cast to bfloat16 then back to input dtype
+        orig_dtype = x.dtype
+        if orig_dtype == torch.float8_e4m3fn or orig_dtype == torch.float8_e5m2:
+            x_bf16 = x.to(dtype=torch.bfloat16)
+            result = F.rms_norm(x_bf16, (x_bf16.size(-1),), eps=self.eps)
+            return result.to(dtype=orig_dtype)
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
@@ -597,8 +603,10 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        # RMSNorm doesn't support FP8, cast to bfloat16 temporarily
+        q_dtype = q.dtype
+        q = F.rms_norm(q.to(dtype=torch.bfloat16), (q.size(-1),)).to(dtype=q_dtype)
+        k = F.rms_norm(k.to(dtype=torch.bfloat16), (k.size(-1),)).to(dtype=k_dtype)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -741,7 +749,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
+        # RMSNorm doesn't support FP8, cast to bfloat16 temporarily
+        x = F.rms_norm(x.to(dtype=torch.bfloat16), (x.size(-1),)).to(dtype=x.dtype)
 
         # Initialize Block AttnRes state
         blocks: list[Tensor] = []
