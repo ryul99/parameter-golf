@@ -642,7 +642,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
-        bsz, seqlen, dim = x.shape
+        bsz, seqlen, dim = x.shape[0], x.shape[1], x.shape[2]
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -831,7 +831,7 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
 
         # Initialize Block AttnRes state
-        bsz, seq_len, dim = x.shape
+        bsz, seq_len, dim = x.shape[0], x.shape[1], x.shape[2]
 
         # Create fresh block_storage tensor for each forward pass
         # This avoids DDP tracking this non-parameter tensor
