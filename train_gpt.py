@@ -521,12 +521,20 @@ def block_attn_res(
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    # Concatenate completed blocks with current partial block
-    V = torch.cat([block_storage[:block_ptr], partial_block.unsqueeze(0)], dim=0)
+    # Get batch and seq dims from partial_block
+    bsz, seq_len, dim = partial_block.shape
 
-    # Normalize each block independently over the feature dimension (last dim)
-    # This ensures each block's representation is normalized separately
-    K = F.rms_norm(V, (V.size(-1),), dim=-1)
+    # Concatenate completed blocks with current partial block
+    # block_storage[:block_ptr] has shape [block_ptr, 1, 1, D], need to expand to [block_ptr, B, T, D]
+    if block_ptr > 0:
+        completed_blocks = block_storage[:block_ptr].expand(-1, bsz, seq_len, dim)
+        V = torch.cat([completed_blocks, partial_block.unsqueeze(0)], dim=0)
+    else:
+        V = partial_block.unsqueeze(0)
+
+    # Normalize over feature dimension (last dim)
+    # F.rms_norm normalizes over the entire tensor, keeping the last dim size
+    K = F.rms_norm(V, (V.size(-1),))
     logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
     h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
     return h
@@ -707,12 +715,12 @@ class Block(nn.Module):
         layers_per_block = self.block_size // 2
 
         # === Check block boundary AT START (before processing layer) ===
-        # Store the completed block from previous layers and start fresh
+        # When entering a new block (except for layer 0), store the completed block
         if self.layer_idx > 0 and self.layer_idx % layers_per_block == 0:
-            # At block boundary: store completed block and start fresh accumulation
+            # Store completed block and start fresh accumulation
             block_storage[block_ptr] = partial_block
             block_ptr += 1
-            # Reset partial_block to start fresh accumulation for next block
+            # Reset partial_block to zeros - new block starts fresh
             partial_block = torch.zeros_like(partial_block)
 
         # === Block AttnRes before attention ===
@@ -723,7 +731,6 @@ class Block(nn.Module):
         partial_block = partial_block + attn_out
 
         # === Block AttnRes before MLP ===
-        # Always include partial_block in the attention computation
         h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
@@ -806,10 +813,10 @@ class GPT(nn.Module):
 
         # Create working block_storage from registered buffer (don't reassign the buffer)
         block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous().clone()
-        # Store normalized embedding as the first block representation
+        # Initialize: embedding is stored as first block, and starts as partial_block
         block_storage[0] = x
         block_ptr = 1  # Next block slot to use
-        partial_block: Tensor = x  # Initialize with normalized embedding
+        partial_block: Tensor = x  # Start accumulating from normalized embedding
 
         # Process all layers
         for block in self.blocks:
