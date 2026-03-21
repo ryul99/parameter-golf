@@ -813,8 +813,13 @@ class GPT(nn.Module):
         # +1 for the embedding, which serves as the first block (before layer 0 processes)
         self.num_block_slots = num_layers // (block_size // 2) + 1
         self.model_dim = model_dim
-        # Note: block_storage is NOT registered as a buffer to avoid DDP tracking it
-        # It's created fresh during each forward pass
+        # Register block_storage as a buffer with max size shape
+        # Will be properly initialized in forward with correct batch/seq dims
+        self.register_buffer(
+            "block_storage",
+            torch.zeros(num_layers // (block_size // 2) + 1, 1, 1, model_dim, dtype=torch.bfloat16),
+            persistent=False,
+        )
 
         self._init_weights()
 
@@ -832,9 +837,15 @@ class GPT(nn.Module):
         # Initialize Block AttnRes state
         bsz, seq_len, dim = x.shape[0], x.shape[1], x.shape[2]
 
-        # Create fresh block_storage tensor for each forward pass
-        # This avoids DDP tracking this non-parameter tensor
-        block_storage = torch.zeros(self.num_block_slots, bsz, seq_len, dim, dtype=x.dtype, device=x.device)
+        # Expand the pre-allocated buffer to the actual batch/sequence size
+        # Use expand() instead of creating a new tensor to avoid recompilation
+        if self.block_storage.shape[1] != bsz or self.block_storage.shape[2] != seq_len:
+            self.block_storage = torch.zeros(
+                self.num_block_slots, bsz, seq_len, dim, dtype=x.dtype, device=x.device
+            )
+        else:
+            self.block_storage.zero_()
+
         # NOTE: Per spec, embedding should be stored as block 0 before layer loop starts.
         # Current implementation stores it at layer 0 boundary, which means first
         # block_attn_res call returns embedding directly without attending over any blocks.
@@ -842,7 +853,9 @@ class GPT(nn.Module):
 
         # Process all layers
         for block in self.blocks:
-            block_storage, block_ptr, partial_block = block(block_storage, block_ptr, x)
+            self.block_storage, block_ptr, partial_block = block(
+                self.block_storage, block_ptr, x
+            )
             x = partial_block  # Update x for next layer (carries forward if not at boundary)
 
         # Use final partial_block as the output (should always be Tensor after all layers)
