@@ -18,6 +18,7 @@ import time
 import uuid
 import zlib
 from collections.abc import Callable
+from typing import cast
 from pathlib import Path
 
 import numpy as np
@@ -690,15 +691,15 @@ class Block(nn.Module):
         self,
         block_storage: Tensor,
         block_ptr: int,
-        partial_block: Tensor | None,
-    ) -> tuple[int, Tensor | None]:
+        partial_block: Tensor,
+    ) -> tuple[int, Tensor]:
         """
         Forward pass with Block Attention Residuals.
 
         Args:
             block_storage: [max_blocks, B, T, D] tensor for block representations
             block_ptr: int - current number of active blocks
-            partial_block: [B, T, D] or None - current intra-block partial sum
+            partial_block: [B, T, D] - current intra-block partial sum
 
         Returns:
             block_ptr: updated number of active blocks
@@ -707,28 +708,28 @@ class Block(nn.Module):
         # === Block AttnRes before attention ===
         h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
-        # Check if we've reached a block boundary
-        # block_size counts ATTN + MLP; each transformer layer has 2
-        is_first_layer = self.layer_idx % (self.block_size // 2) == 0
-        if is_first_layer:
-            # Store the partial_block as a new completed block
-            block_storage[block_ptr] = partial_block
-            block_ptr += 1
-            # Reset partial_block for the new block
-            partial_block = None
-
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
-        partial_block = (partial_block + attn_out) if partial_block is not None else attn_out
+        partial_block = partial_block + attn_out
 
         # === Block AttnRes before MLP ===
         h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
-        partial_block = (partial_block + mlp_out) if partial_block is not None else mlp_out
+        partial_block = partial_block + mlp_out
 
-        return block_ptr, partial_block
+        # Check if we've reached a block boundary (END of block)
+        # block_size counts ATTN + MLP; each transformer layer has 2
+        is_last_layer = (self.layer_idx + 1) % (self.block_size // 2) == 0
+        if is_last_layer:
+            # Store the completed block and reset partial_block
+            block_storage[block_ptr] = partial_block
+            block_ptr += 1
+            # Reset partial_block to None for the next block
+            partial_block = None
+
+        return block_ptr, cast(Tensor | None, partial_block)
 
 
 class GPT(nn.Module):
@@ -807,14 +808,18 @@ class GPT(nn.Module):
             self.block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous()
 
         block_storage = self.block_storage
-        block_ptr = 0
-        partial_block: Tensor | None = None
+        # Store normalized embedding as the first block representation
+        block_storage[0] = x
+        block_ptr = 1  # Next block slot to use
+        partial_block: Tensor = x  # Start with embedding as current partial sum
 
         # Process all layers
         for block in self.blocks:
             block_ptr, partial_block = block(block_storage, block_ptr, partial_block)
 
-        # Use final partial_block as the output
+        # Use final partial_block as the output (should not be None at the end)
+        if partial_block is None:
+            raise RuntimeError("partial_block is None at end of forward pass")
         x = partial_block
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
