@@ -504,7 +504,7 @@ class DistributedTokenLoader:
 def block_attn_res(
     block_storage: Tensor,
     block_ptr: int,
-    partial_block: Tensor,
+    partial_block: Tensor | None,
     proj: nn.Linear,
     norm_fn: Callable[[Tensor], Tensor],
 ) -> Tensor:
@@ -514,30 +514,38 @@ def block_attn_res(
     Args:
         block_storage: [max_blocks, B, T, D] - pre-allocated tensor for block representations
         block_ptr: int - number of active blocks in storage
-        partial_block: [B, T, D] - intra-block partial sum
+        partial_block: [B, T, D] or None - intra-block partial sum (None at block start)
         proj: Linear projection layer for query
         norm_fn: normalization function (e.g., RMSNorm)
 
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    # Get batch and seq dims from partial_block
-    bsz, seq_len, dim = partial_block.shape
-
     # Concatenate completed blocks with current partial block
     # block_storage[:block_ptr] has shape [block_ptr, 1, 1, D], need to expand to [block_ptr, B, T, D]
     if block_ptr > 0:
-        completed_blocks = block_storage[:block_ptr].expand(-1, bsz, seq_len, dim)
-        V = torch.cat([completed_blocks, partial_block.unsqueeze(0)], dim=0)
+        if partial_block is not None:
+            bsz, seq_len, dim = partial_block.shape
+            completed_blocks = block_storage[:block_ptr].expand(-1, bsz, seq_len, dim)
+            V = torch.cat([completed_blocks, partial_block.unsqueeze(0)], dim=0)
+        else:
+            # Only completed blocks, no partial_block yet (fresh block start)
+            # Return first completed block as default (spec: return aggregated attention over blocks)
+            V = block_storage[:block_ptr]
+        # Normalize over feature dimension (last dim)
+        # F.rms_norm normalizes over the entire tensor, keeping the last dim size
+        K = F.rms_norm(V, (V.size(-1),))
+        logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
+        h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
+        return h
     else:
-        V = partial_block.unsqueeze(0)
-
-    # Normalize over feature dimension (last dim)
-    # F.rms_norm normalizes over the entire tensor, keeping the last dim size
-    K = F.rms_norm(V, (V.size(-1),))
-    logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
-    h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
-    return h
+        # No completed blocks yet, return zeros as base (layer 0 case)
+        # partial_block will be the embedding or accumulated output
+        if partial_block is not None:
+            return partial_block
+        # This shouldn't happen in normal flow (layer 0 always has embedding as partial_block)
+        # But provide a safe fallback
+        return torch.zeros_like(block_storage[0])
 
 
 # -----------------------------
@@ -697,15 +705,15 @@ class Block(nn.Module):
         self,
         block_storage: Tensor,
         block_ptr: int,
-        partial_block: Tensor,
-    ) -> tuple[Tensor, int, Tensor]:
+        partial_block: Tensor | None,
+    ) -> tuple[Tensor, int, Tensor | None]:
         """
         Forward pass with Block Attention Residuals.
 
         Args:
             block_storage: [max_blocks, B, T, D] tensor for block representations
             block_ptr: int - current number of active blocks
-            partial_block: [B, T, D] - current intra-block partial sum
+            partial_block: [B, T, D] or None - current intra-block partial sum (None at block boundaries)
 
         Returns:
             block_storage: updated block storage tensor
@@ -721,22 +729,23 @@ class Block(nn.Module):
 
         # === Check block boundary AFTER AttnRes (matches spec order) ===
         # At block boundaries (layers 0, 2, 4, ... for block_size=4), store the completed
-        # block from previous accumulation and reset partial_block for accumulating the next block.
+        # block from previous accumulation and signal reset via None (matches spec's None).
         if is_block_start:
             block_storage[block_ptr] = partial_block
             block_ptr += 1
-            partial_block = torch.zeros_like(partial_block)
+            partial_block = None
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
-        partial_block = partial_block + attn_out
+        partial_block = attn_out if partial_block is None else partial_block + attn_out
 
         # === Block AttnRes before MLP ===
         h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
-        partial_block = partial_block + mlp_out
+        # partial_block should never be None here (always set after attention)
+        partial_block = partial_block + mlp_out  # type: ignore[arg-type]
 
         return block_storage, block_ptr, partial_block
 
@@ -816,14 +825,14 @@ class GPT(nn.Module):
         block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous().clone()
         # Initialize: embedding starts as partial_block, will be stored at layer 0 block boundary
         block_ptr = 0  # First block slot to use (embedding will be stored here at layer 0)
-        partial_block: Tensor = x  # Start accumulating from normalized embedding
+        partial_block: Tensor | None = x  # Start accumulating from normalized embedding
 
         # Process all layers
         for block in self.blocks:
             block_storage, block_ptr, partial_block = block(block_storage, block_ptr, partial_block)
 
-        # Use final partial_block as the output
-        x = partial_block
+        # Use final partial_block as the output (should always be Tensor after all layers)
+        x = partial_block  # type: ignore[assignment]
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
