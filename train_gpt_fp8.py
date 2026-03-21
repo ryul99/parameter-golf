@@ -121,7 +121,11 @@ class FP8Linear(nn.Module):
 
         # Cache FP8 hyperparameters
         hp = Hyperparameters()
-        self._fp8_output_grad = hp.fp8_output_grad
+        # Check if compiled_autograd is available (PyTorch 2.5+)
+        import inspect
+        compile_sig = inspect.signature(torch.compile)
+        has_compiled_autograd = 'compiled_autograd' in compile_sig.parameters
+        self._fp8_output_grad = hp.fp8_output_grad and has_compiled_autograd
         self._fp8_margin = hp.fp8_margin0
         self._fp8_interval = hp.fp8_interval
         self._amax_history_len = hp.fp8_amax_history_len
@@ -983,7 +987,13 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    log0(f"FP8 training enabled: output_grad={args.fp8_output_grad}")
+
+    # Check if compiled_autograd is available
+    import inspect
+    compile_sig = inspect.signature(torch.compile)
+    has_compiled_autograd = 'compiled_autograd' in compile_sig.parameters
+    fp8_output_grad_status = "enabled" if args.fp8_output_grad and has_compiled_autograd else "disabled (PyTorch < 2.5)"
+    log0(f"FP8 training enabled: output_grad={fp8_output_grad_status}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1006,7 +1016,7 @@ def main() -> None:
 
     restore_fp8_master_params_to_fp32(base_model)
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, compiled_autograd=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=True) if distributed else compiled_model
 
     # Optimizer split
@@ -1060,7 +1070,12 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"attnres q_init_std={args.attnres_q_init_std}")
-    log0(f"FP8 training: enabled (delayed scaling, output_grad={args.fp8_output_grad})")
+
+    import inspect
+    compile_sig = inspect.signature(torch.compile)
+    has_compiled_autograd = 'compiled_autograd' in compile_sig.parameters
+    fp8_output_grad_actual = args.fp8_output_grad and has_compiled_autograd
+    log0(f"FP8 training: enabled (delayed scaling, output_grad={fp8_output_grad_actual})")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
