@@ -70,7 +70,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    attnres_q_init_std = float(os.environ.get("ATTNRES_Q_INIT_STD", "0.02"))
+    attnres_proj_init_std = float(os.environ.get("ATTNRES_PROJ_INIT_STD", "0.02"))
+    block_size = int(os.environ.get("BLOCK_SIZE", "4"))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -291,7 +292,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,attn_res_q",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,attn_res_proj,mlp_res_proj",
     ).split(",")
     if pattern
 )
@@ -496,46 +497,45 @@ class DistributedTokenLoader:
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
-# FULL ATTENTION RESIDUALS
+# BLOCK ATTENTION RESIDUALS
 # -----------------------------
 
-def attn_res(
-    prev_layers: list[Tensor],
-    query_vec: Tensor,
+def block_attn_res(
+    blocks: list[Tensor],
+    partial_block: Tensor,
+    proj: nn.Linear,
     norm_fn: Callable[[Tensor], Tensor],
 ) -> Tensor:
     """
-    Apply attention over all previous layer outputs.
-
-    This implements Full Attention Residuals (AttnRes) which allows each
-    layer to selectively attend over all previous layer representations using
-    a learned pseudo-query vector.
+    Inter-block attention: attend over block reps + partial sum.
 
     Args:
-        prev_layers: list of [B, T, D] tensors from previous layers
-        query_vec: [D] - learned pseudo-query vector
+        blocks: N tensors of shape [B, T, D] - completed block representations
+        partial_block: [B, T, D] - intra-block partial sum
+        proj: Linear projection layer for query
         norm_fn: normalization function (e.g., RMSNorm)
 
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    if not prev_layers:
-        raise ValueError("prev_layers cannot be empty")
+    if not blocks:
+        # If no blocks yet, just use the partial block
+        return partial_block
 
-    # Stack all previous layers: [N, B, T, D]
-    V = torch.stack(prev_layers, dim=0)
+    # Stack all blocks + partial: [N+1, B, T, D]
+    V = torch.stack(blocks + [partial_block], dim=0)
 
-    # Normalize keys: [N, B, T, D]
+    # Normalize keys: [N+1, B, T, D]
     K = norm_fn(V)
 
-    # Compute logits: query_vec @ K -> [N, B, T]
-    logits = torch.sum(query_vec.view(1, 1, 1, -1) * K, dim=-1)
+    # Compute logits: proj.weight @ K -> [N+1, B, T]
+    logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
 
-    # Softmax over layer dimension: [N, B, T]
+    # Softmax over block dimension: [N+1, B, T]
     weights = torch.softmax(logits, dim=0)
 
-    # Weighted sum: [N, B, T, D] -> [B, T, D]
-    h = torch.sum(weights.unsqueeze(-1) * V, dim=0)
+    # Weighted sum: [N+1, B, T, D] -> [B, T, D]
+    h = torch.einsum('n b t, n b t d -> b t d', weights, V)
 
     return h
 
@@ -673,7 +673,9 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        attnres_q_init_std: float = 0.02,
+        attnres_proj_init_std: float = 0.02,
+        layer_idx: int = 0,
+        block_size: int = 4,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -682,40 +684,54 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        # Full AttnRes query vector (for attending over all previous layers)
-        # Initialized with smaller std dev as this is a learned pseudo-query vector
-        self.attn_res_q = nn.Parameter(torch.randn(dim, dtype=torch.float32) * attnres_q_init_std)
+        # Block AttnRes projections for attending over block representations
+        # Initialized with smaller std dev as these are learned query vectors
+        self.attn_res_proj = CastedLinear(dim, 1, bias=False)
+        self.mlp_res_proj = CastedLinear(dim, 1, bias=False)
+        nn.init.normal_(self.attn_res_proj.weight, mean=0.0, std=attnres_proj_init_std)
+        nn.init.normal_(self.mlp_res_proj.weight, mean=0.0, std=attnres_proj_init_std)
+
+        # Track layer position and block boundaries
+        self.layer_idx = layer_idx
+        self.block_size = block_size  # Counts ATTN + MLP; each transformer layer has 2
 
     def forward(
         self,
-        x: Tensor,
-        prev_layers: list[Tensor],
-    ) -> Tensor:
+        blocks: list[Tensor],
+        partial_block: Tensor,
+    ) -> tuple[list[Tensor], Tensor]:
         """
-        Forward pass with Full Attention Residuals.
+        Forward pass with Block Attention Residuals.
 
         Args:
-            x: Current hidden state [B, T, D]
-            prev_layers: list of [B, T, D] tensors from all previous layers
+            blocks: list of [B, T, D] tensors from previous completed blocks
+            partial_block: [B, T, D] - current intra-block partial sum
 
         Returns:
-            output: Result after this layer [B, T, D]
+            blocks: updated list of block representations
+            partial_block: updated intra-block partial sum
         """
-        # === Full AttnRes before attention ===
-        h = attn_res(prev_layers, self.attn_res_q, self.attn_norm)
+        # === Block AttnRes before attention ===
+        h = block_attn_res(blocks, partial_block, self.attn_res_proj, self.attn_norm)
 
-        # Self-attention with residual
+        # Check if we've reached a block boundary
+        # block_size counts ATTN + MLP; each transformer layer has 2
+        if self.layer_idx % (self.block_size // 2) == 0:
+            blocks.append(partial_block)
+            partial_block = torch.zeros_like(partial_block)
+
+        # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        partial_block = partial_block + self.attn_scale.to(dtype=partial_block.dtype)[None, None, :] * attn_out
 
-        # === Full AttnRes before MLP ===
-        h = attn_res(prev_layers + [x], self.attn_res_q, self.mlp_norm)
+        # === Block AttnRes before MLP ===
+        h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_norm)
 
-        # MLP with residual
+        # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        partial_block = partial_block + self.mlp_scale.to(dtype=partial_block.dtype)[None, None, :] * mlp_out
 
-        return x
+        return blocks, partial_block
 
 
 class GPT(nn.Module):
@@ -732,7 +748,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        attnres_q_init_std: float = 0.02,
+        attnres_proj_init_std: float = 0.02,
+        block_size: int = 4,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -741,10 +758,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -754,7 +767,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    attnres_q_init_std,
+                    attnres_proj_init_std,
+                    layer_idx=i,
+                    block_size=block_size,
                 )
                 for i in range(num_layers)
             ]
@@ -776,24 +791,16 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
 
-        # Initialize Full AttnRes state with token embedding
-        prev_layers: list[Tensor] = [x]
-        skips: list[Tensor] = []
+        # Initialize Block AttnRes state
+        blocks: list[Tensor] = [x]  # Start with token embedding as first block
+        partial_block = torch.zeros_like(x)
 
-        # Encoder phase: accumulate skip connections
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, prev_layers)
-            prev_layers.append(x)
-            skips.append(x)
+        # Process all layers
+        for block in self.blocks:
+            blocks, partial_block = block(blocks, partial_block)
 
-        # Decoder phase: consume skip connections
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            layer_idx = self.num_encoder_layers + i
-            x = self.blocks[layer_idx](x, prev_layers)
-            prev_layers.append(x)
-
+        # Use final partial_block as the output
+        x = partial_block
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -917,7 +924,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        attnres_q_init_std=args.attnres_q_init_std,
+        attnres_proj_init_std=args.attnres_proj_init_std,
+        block_size=args.block_size,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -942,8 +950,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -980,7 +986,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"attnres q_init_std={args.attnres_q_init_std}")
+    log0(f"block_attnres proj_init_std={args.attnres_proj_init_std} block_size={args.block_size}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
