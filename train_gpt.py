@@ -691,8 +691,8 @@ class Block(nn.Module):
         self,
         block_storage: Tensor,
         block_ptr: int,
-        partial_block: Tensor,
-    ) -> tuple[int, Tensor]:
+        partial_block: Tensor | None,
+    ) -> tuple[int, Tensor | None]:
         """
         Forward pass with Block Attention Residuals.
 
@@ -740,7 +740,7 @@ class Block(nn.Module):
         mlp_out = self.mlp(self.mlp_norm(h))
         partial_block = partial_block + mlp_out
 
-        return block_ptr, cast(Tensor | None, partial_block)
+        return block_ptr, partial_block
 
 
 class GPT(nn.Module):
