@@ -528,7 +528,7 @@ def block_attn_res(
             h = norm_fn(partial_block)
             # proj.weight is [1, D], h is [B, T, D]
             # Use element-wise multiplication followed by sum over D to get scalar scaling
-            scaling = (h * proj.weight.transpose(0, 1).unsqueeze(1)).sum(dim=-1, keepdim=True)  # [B, T, 1]
+            scaling = (h * proj.weight.unsqueeze(0).unsqueeze(0)).sum(dim=-1, keepdim=True)  # [B, T, 1]
             return partial_block * scaling
         else:
             return torch.zeros_like(block_storage[0])
