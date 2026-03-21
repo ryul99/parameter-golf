@@ -1,6 +1,13 @@
 """
 FP8-optimized training script for H100 GPUs.
-Based on train_gpt.py with FP8 (float8_e4m3fn/float8_e5m2) support for faster training.
+Based on train_gpt.py with FP8 (float8_e4m3fn) autocast for faster training.
+
+Uses PyTorch's native FP8 autocast support:
+- Forward pass: float8_e4m3fn for wider dynamic range
+- Weights stored in fp32 for optimizer stability
+- Automatic FP8 conversion happens during matmul operations
+
+Requires: H100 GPU (compute capability 9.0+)
 """
 
 from __future__ import annotations
@@ -64,15 +71,11 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    attnres_proj_init_std = float(os.environ.get("ATTNRES_PROJ_INIT_STD", "0.02"))
+    attnres_proj_init_std = float(os.environ.get("ATTNRES_PROJ_INIT_STD", 0.02))
     block_size = int(os.environ.get("BLOCK_SIZE", "4"))
 
-    # FP8-specific settings
-    fp8_margin = int(os.environ.get("FP8_MARGIN", 0))
-    fp8_interval = int(os.environ.get("FP8_INTERVAL", 1))
-    fp8_amax_history_len = int(os.environ.get("FP8_AMAX_HISTORY_LEN", 1024))
-    fp8_amax_compute_algo = os.environ.get("FP8_AMAX_COMPUTE_ALGO", "most_recent")
+    # FP8-specific settings (for future use with Transformer Engine)
+    # Currently using PyTorch's native FP8 autocast
 
     # Optimizer hyperparameters
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -95,56 +98,8 @@ class Hyperparameters:
 # -----------------------------
 
 def get_fp8_dtype() -> torch.dtype:
-    """Get FP8 data type for H100."""
+    """Get FP8 data type for H100 forward pass."""
     return torch.float8_e4m3fn
-
-
-class FP8Linear(nn.Linear):
-    """
-    FP8-aware Linear layer that maintains weights in high precision
-    but computes in FP8 for H100 acceleration.
-    """
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
-        super().__init__(in_features, out_features, bias=bias)
-        self.fp8_dtype = get_fp8_dtype()
-        self._input_scale = 1.0
-        self._weight_scale = 1.0
-        self._output_scale = 1.0
-
-    def forward(self, x: Tensor) -> Tensor:
-        # Compute in high precision, let autocast handle FP8 conversion
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
-
-
-class FP8ScaledLinear(nn.Module):
-    """
-    FP8 Linear layer with explicit scaling for better numerical stability.
-    Useful for critical layers like attention projections.
-    """
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.fp8_dtype = get_fp8_dtype()
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        self.input_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
-        self.weight_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
-        self.output_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
-        self._zero_init = False
-
-    def forward(self, x: Tensor) -> Tensor:
-        # Let PyTorch's FP8 autocast handle the conversion
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
 
 
 # -----------------------------
@@ -303,8 +258,8 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            # Use FP8 autocast for validation as well
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            # Use FP8 autocast for validation
+            with torch.autocast(device_type="cuda", dtype=fp8_dtype, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -914,7 +869,7 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    log0(f"fp8_dtype:{fp8_dtype} fp8_margin:{args.fp8_margin} fp8_interval:{args.fp8_interval}")
+    log0(f"fp8_dtype:{fp8_dtype} fp8_autocast:enabled")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1040,7 +995,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=fp8_dtype, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1108,8 +1063,8 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            # FP8 autocast will automatically convert to FP8 where beneficial on H100
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            # FP8 autocast for H100 acceleration
+            with torch.autocast(device_type="cuda", dtype=fp8_dtype, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
