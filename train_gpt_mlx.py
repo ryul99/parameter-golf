@@ -289,17 +289,11 @@ class AttnResContext:
     The token embedding is treated as block 0, stored at index 0 in blocks_reps.
     next_block_idx points to the slot where the next completed block will be stored.
     """
-    blocks_reps: list[mx.array]
+    blocks_reps: list[mx.array | None]
     partial_block: mx.array | None
     is_block_boundary: bool
     num_blocks: int  # Maximum number of blocks to track
     next_block_idx: int = 0  # Index for next block to store
-
-
-def detached_array(x: mx.array) -> mx.array:
-    # Stored block memories should not keep the full upstream autograd graph alive.
-    stop_gradient = getattr(mx, "stop_gradient", None)
-    return stop_gradient(x) if stop_gradient is not None else x
 
 
 def block_attn_res(
@@ -475,9 +469,7 @@ class Block(nn.Module):
             - output: Result after this layer [B, T, D]
             - partial_block: Accumulated state within current block [B, T, D]
         """
-        # Initialize or use partial_block from previous layer
-        # If partial_block is None (either at layer 0 or after a block boundary),
-        # start a new accumulation with the current hidden state
+        # Initialize or use partial_block from previous layer.
         partial_block = attnres_ctx.partial_block if attnres_ctx else None
         if partial_block is None:
             partial_block = x
@@ -492,9 +484,18 @@ class Block(nn.Module):
         else:
             h = x
 
+        # Match the reference pseudocode: boundary layers first finalize the
+        # previous block memory, then start a new block for the current layer.
+        if attnres_ctx is not None and attnres_ctx.is_block_boundary:
+            if attnres_ctx.next_block_idx < len(attnres_ctx.blocks_reps):
+                attnres_ctx.blocks_reps[attnres_ctx.next_block_idx] = partial_block
+                attnres_ctx.next_block_idx += 1
+            partial_block = None
+
         # Self-attention with residual
         attn_out = self.attn(self.attn_norm(h))
-        partial_block = partial_block + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        scaled_attn = self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        partial_block = partial_block + scaled_attn if partial_block is not None else scaled_attn
 
         # === Block AttnRes before MLP ===
         if attnres_ctx is not None and attnres_ctx.next_block_idx > 0:
@@ -506,29 +507,10 @@ class Block(nn.Module):
         mlp_out = self.mlp(self.mlp_norm(h))
         partial_block = partial_block + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
 
-        # The next layer should always consume the updated residual state. If we
-        # only keep it in the AttnRes side context, MLX can retain a large dead
-        # branch of the graph that never reaches the model output.
-        output = partial_block
-
-        # Handle block boundary: finalize current block and start new one
-        # When this layer is a boundary, we store the accumulated partial_block
-        # (which contains ATTN + MLP outputs from this layer) as a block
-        # representation, then reset partial_block so the next layer starts fresh.
-        if attnres_ctx is not None and attnres_ctx.is_block_boundary:
-            # Store a detached block memory at the next available slot
-            if attnres_ctx.next_block_idx < len(attnres_ctx.blocks_reps):
-                attnres_ctx.blocks_reps[attnres_ctx.next_block_idx] = detached_array(partial_block)
-                attnres_ctx.next_block_idx += 1
-            # Reset partial_block for the new block (next layer will initialize it)
-            partial_block = None
-
         if attnres_ctx is not None:
             attnres_ctx.partial_block = partial_block
 
-        # Return the real block output plus the intra-block accumulator for the
-        # next layer's AttnRes context.
-        return output, partial_block
+        return partial_block, partial_block
 
 
 class GPT(nn.Module):
@@ -555,7 +537,7 @@ class GPT(nn.Module):
 
         # Block AttnRes configuration
         # block_boundaries contains layer indices where new blocks start
-        # e.g., {1, 2, 3, 5, 6, 7, 8} means layers 1,2,3,5,6,7,8 each start a new block
+        # e.g., {1, 2, 3, 4, 6, 7, 8} means layers 1,2,3,4,6,7,8 each start a new block
         self.num_attnres_blocks = num_attnres_blocks
         self.block_boundaries = self._compute_block_boundaries(num_layers, num_attnres_blocks)
 
@@ -588,8 +570,8 @@ class GPT(nn.Module):
         - 18 sub-layers / 8 blocks = 2.25 sub-layers per block
         - Cumulative sub-layers: 2.25, 4.5, 6.75, 9, 11.25, 13.5, 15.75
         - Converted to layers: 1.125, 2.25, 3.375, 4.5, 5.625, 6.75, 7.875
-        - Rounded to layer boundaries: {1, 2, 3, 5, 6, 8}
-        - After filtering (< num_layers): {1, 2, 3, 5, 6, 7, 8}
+        - Rounded to layer boundaries: {1, 2, 3, 4, 6, 7, 8}
+        - After filtering (< num_layers): {1, 2, 3, 4, 6, 7, 8}
 
         This creates blocks with varying sizes (some with 1 layer, some with 2)
         to approximate equal computation per block.
@@ -622,7 +604,7 @@ class GPT(nn.Module):
             # Index 0 is reserved for the token embedding (input representation)
             # Indices 1..N will store completed block representations
             max_blocks = self.num_attnres_blocks + 1  # +1 for token embedding
-            blocks_reps = [detached_array(x)] + [None] * (max_blocks - 1)
+            blocks_reps = [x] + [None] * (max_blocks - 1)
             attnres_ctx = AttnResContext(
                 blocks_reps=blocks_reps,
                 partial_block=None,
@@ -637,9 +619,8 @@ class GPT(nn.Module):
 
         # Encoder phase: accumulate skip connections
         for i in range(self.num_encoder_layers):
-            # Check if CURRENT layer starts a new block (is a block boundary)
-            # If so, the Block.__call__ will finalize the previous block's accumulation
-            # before processing this layer
+            # Boundary layers finalize the previous block before applying the
+            # current layer, matching attention_residuals.md.
             is_boundary = i in self.block_boundaries
             if attnres_ctx:
                 attnres_ctx.is_block_boundary = is_boundary
@@ -651,7 +632,8 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             layer_idx = self.num_encoder_layers + i
-            # Check if CURRENT layer starts a new block (is a block boundary)
+            # Boundary layers finalize the previous block before applying the
+            # current layer, matching attention_residuals.md.
             is_boundary = layer_idx in self.block_boundaries
             if attnres_ctx:
                 attnres_ctx.is_block_boundary = is_boundary
