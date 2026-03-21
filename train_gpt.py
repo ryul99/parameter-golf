@@ -510,12 +510,12 @@ def block_attn_res(
     norm_fn: Callable[[Tensor], Tensor],
 ) -> Tensor:
     """
-    Inter-block attention: attend over block reps + partial sum.
+    Inter-block attention: attend over block reps + optional partial sum.
 
     Args:
         block_storage: [max_blocks, B, T, D] - pre-allocated tensor for block representations
         block_ptr: int - number of active blocks in storage
-        partial_block: [B, T, D] or None - intra-block partial sum
+        partial_block: [B, T, D] or None - intra-block partial sum (None at block starts)
         proj: Linear projection layer for query
         norm_fn: normalization function (e.g., RMSNorm)
 
@@ -705,12 +705,33 @@ class Block(nn.Module):
             block_ptr: updated number of active blocks
             partial_block: updated intra-block partial sum
         """
-        # === Block AttnRes before attention ===
-        h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
+        # Check if we're at the START of a new block
+        # block_size counts ATTN + MLP; each transformer layer has 2
+        layers_per_block = self.block_size // 2
+        if self.layer_idx % layers_per_block == 0:
+            # At block boundary: store completed block and reset
+            if self.layer_idx > 0:
+                # Store the completed block from previous layers
+                block_storage[block_ptr] = partial_block
+                block_ptr += 1
+            # Reset partial_block to None for the new block
+            partial_block = None
+
+        # If partial_block is None (start of a block), we need to initialize it
+        # by using the output from block_attn_res with only block_storage
+        if partial_block is None:
+            # Block AttnRes with only completed blocks (no intra-block partial yet)
+            V = block_storage[:block_ptr]
+            K = self.attn_norm(V)
+            logits = torch.einsum('d, n b t d -> n b t', self.attn_res_proj.weight.squeeze(), K)
+            h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
+        else:
+            # === Block AttnRes before attention ===
+            h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
-        partial_block = partial_block + attn_out
+        partial_block = partial_block + attn_out if partial_block is not None else attn_out
 
         # === Block AttnRes before MLP ===
         h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
@@ -718,16 +739,6 @@ class Block(nn.Module):
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
         partial_block = partial_block + mlp_out
-
-        # Check if we've reached a block boundary (END of block)
-        # block_size counts ATTN + MLP; each transformer layer has 2
-        is_last_layer = (self.layer_idx + 1) % (self.block_size // 2) == 0
-        if is_last_layer:
-            # Store the completed block and reset partial_block
-            block_storage[block_ptr] = partial_block
-            block_ptr += 1
-            # Reset partial_block to None for the next block
-            partial_block = None
 
         return block_ptr, cast(Tensor | None, partial_block)
 
@@ -811,7 +822,7 @@ class GPT(nn.Module):
         # Store normalized embedding as the first block representation
         block_storage[0] = x
         block_ptr = 1  # Next block slot to use
-        partial_block: Tensor = x  # Start with embedding as current partial sum
+        partial_block: Tensor | None = None  # Will be initialized at layer 0
 
         # Process all layers
         for block in self.blocks:
