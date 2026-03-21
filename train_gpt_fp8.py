@@ -122,8 +122,10 @@ class FP8Linear(nn.Module):
         # Cache FP8 hyperparameters
         hp = Hyperparameters()
         self._fp8_output_grad = hp.fp8_output_grad
+        self._fp8_margin = hp.fp8_margin0
         self._fp8_interval = hp.fp8_interval
         self._amax_history_len = hp.fp8_amax_history_len
+        self._amax_compute_algo = hp.fp8_amax_compute_algo
 
         # Keep master weights in FP32
         self.weight = nn.Parameter(
@@ -134,18 +136,10 @@ class FP8Linear(nn.Module):
         ) if bias else None
 
         # FP8 scaling factors
-        self.input_scale = nn.Parameter(
-            torch.ones((), dtype=torch.float32, device=device), requires_grad=False
-        )
-        self.weight_scale = nn.Parameter(
-            torch.ones((), dtype=torch.float32, device=device), requires_grad=False
-        )
-        self.output_grad_scale = nn.Parameter(
-            torch.ones((), dtype=torch.float32, device=device), requires_grad=False
-        )
-        self.amdg_scale = nn.Parameter(
-            torch.ones((), dtype=torch.float32, device=device), requires_grad=False
-        )
+        self.register_buffer("input_scale", torch.ones((), dtype=torch.float32, device=device))
+        self.register_buffer("weight_scale", torch.ones((), dtype=torch.float32, device=device))
+        self.register_buffer("output_grad_scale", torch.ones((), dtype=torch.float32, device=device))
+        self.register_buffer("amdg_scale", torch.ones((), dtype=torch.float32, device=device))
 
         # AMAX history for dynamic scaling
         self.register_buffer(
@@ -160,9 +154,10 @@ class FP8Linear(nn.Module):
             "output_grad_amax_history",
             torch.zeros(self._amax_history_len, dtype=torch.float32, device=device)
         )
-        self.history_idx = 0
+        self.register_buffer("history_idx", torch.zeros((), dtype=torch.long, device=device))
 
         self._zero_init = False
+        self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -174,19 +169,41 @@ class FP8Linear(nn.Module):
             nn.init.zeros_(self.weight)
 
     @torch.no_grad()
+    def _sync_amax(self, amax: Tensor) -> Tensor:
+        return amax.float()
+
+    @torch.no_grad()
+    def _history_amax(self, amax_history: Tensor) -> Tensor:
+        if self._amax_compute_algo == "most_recent":
+            idx = (int(self.history_idx.item()) - 1) % self._amax_history_len
+            return amax_history[idx].float()
+        return amax_history.float().max()
+
+    @torch.no_grad()
     def _update_scale(self, amax_history: Tensor, scale: Tensor) -> None:
         """Update scale based on AMAX history using delayed scaling."""
-        amax = amax_history.float().max()
-        # FP8_e4m3 max is 448, we use margin to avoid saturation
-        fp8_max = 448.0
+        amax = self._history_amax(amax_history)
+        fp8_max = 448.0 / (2 ** self._fp8_margin)
         scale.copy_(amax / fp8_max).clamp_(min=1e-4, max=1e4)
 
     @torch.no_grad()
     def _update_history(self, history: Tensor, new_amax: Tensor) -> None:
         """Update AMAX history ring buffer."""
-        idx = self.history_idx % self._amax_history_len
+        idx = int(self.history_idx.item()) % self._amax_history_len
         history[idx] = new_amax.float()
-        self.history_idx += 1
+        self.history_idx.add_(1)
+
+    def _quantize_output_grad(self, grad: Tensor) -> Tensor:
+        scale = self.output_grad_scale.clamp(min=1e-4, max=1e4)
+        grad_fp8 = torch.ops.aten._to_copy(grad / scale, dtype=torch.float8_e5m2)
+        quantized_grad = grad_fp8.to(dtype=grad.dtype) * scale
+        with torch.no_grad():
+            grad_amax = self._sync_amax(grad.detach().abs().max())
+            self._update_history(self.output_grad_amax_history, grad_amax)
+            if int(self.history_idx.item()) % self._fp8_interval == 0:
+                self._update_scale(self.output_grad_amax_history, self.output_grad_scale)
+            self.amdg_scale.copy_(self.output_grad_scale)
+        return quantized_grad
 
     def forward(self, x: Tensor) -> Tensor:
         # For inference/val, use BF16 for compatibility
@@ -195,30 +212,19 @@ class FP8Linear(nn.Module):
             bias = self.bias.to(x.dtype) if self.bias is not None else None
             return F.linear(x, weight, bias)
 
-        # Training: use FP8 matmul with delayed scaling
-        # Update and get input scale
-        input_amax = x.abs().max().detach()
-        self._update_history(self.input_amax_history, input_amax)
-        if self.history_idx % self._fp8_interval == 0:
-            self._update_scale(self.input_amax_history, self.input_scale)
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
 
-        # Update and get weight scale
-        weight_amax = self.weight.abs().max().detach()
-        self._update_history(self.weight_amax_history, weight_amax)
-        if self.history_idx % self._fp8_interval == 0:
-            self._update_scale(self.weight_amax_history, self.weight_scale)
-
-        # Quantize input to FP8_e4m3fn
-        x_scaled = x / self.input_scale
+        # Training: use delayed scales from the previous step, then update AMAX state
+        # for the next step after quantization.
+        x_scaled = x_2d / self.input_scale
         x_fp8 = torch.ops.aten._to_copy(x_scaled, dtype=torch.float8_e4m3fn)
 
-        # Quantize weight to FP8_e4m3fn (transpose for row-major)
+        # Quantize weight to FP8_e4m3fn and run a 2D GEMM.
         w_scaled = (self.weight / self.weight_scale).t()
         w_fp8 = torch.ops.aten._to_copy(w_scaled, dtype=torch.float8_e4m3fn)
 
-        # Use FP8 matmul with scaled output on H100
-        # _scaled_mm expects: [M, K] @ [N, K]^T -> [M, N]
-        out_fp8, out_amax = torch._scaled_mm(
+        scaled_mm_out = torch._scaled_mm(
             x_fp8,
             w_fp8,
             out_dtype=torch.bfloat16,
@@ -226,15 +232,23 @@ class FP8Linear(nn.Module):
             scale_b=self.weight_scale,
             bias=self.bias.to(torch.bfloat16) if self.bias is not None else None,
         )
+        out = scaled_mm_out[0] if isinstance(scaled_mm_out, tuple) else scaled_mm_out
+        out = out.reshape(*x_shape[:-1], self.out_features)
 
-        # Update output scale for gradient computation
-        if self._fp8_output_grad:
-            self._update_history(self.output_grad_amax_history, out_amax)
-            if self.history_idx % self._fp8_interval == 0:
-                self._update_scale(self.output_grad_amax_history, self.output_grad_scale)
-            self.amdg_scale.copy_(self.output_grad_scale)
+        if self._fp8_output_grad and out.requires_grad:
+            out.register_hook(self._quantize_output_grad)
 
-        return out_fp8
+        input_amax = self._sync_amax(x_2d.detach().abs().max())
+        self._update_history(self.input_amax_history, input_amax)
+        if int(self.history_idx.item()) % self._fp8_interval == 0:
+            self._update_scale(self.input_amax_history, self.input_scale)
+
+        weight_amax = self._sync_amax(self.weight.detach().abs().max())
+        self._update_history(self.weight_amax_history, weight_amax)
+        if int(self.history_idx.item()) % self._fp8_interval == 0:
+            self._update_scale(self.weight_amax_history, self.weight_scale)
+
+        return out
 
 
 class FP8Embedding(nn.Embedding):
@@ -250,6 +264,13 @@ class FP8Embedding(nn.Embedding):
             self.scale_grad_by_freq,
             self.sparse
         )
+
+
+def restore_fp8_master_params_to_fp32(module: nn.Module) -> None:
+    with torch.no_grad():
+        for submodule in module.modules():
+            if isinstance(submodule, (FP8Linear, FP8Embedding)):
+                submodule.float()
 
 
 # -----------------------------
@@ -853,7 +874,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, self.tok_emb.weight.to(dtype=x.dtype))
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -983,9 +1004,10 @@ def main() -> None:
         attnres_q_init_std=args.attnres_q_init_std,
     ).to(device).bfloat16()
 
+    restore_fp8_master_params_to_fp32(base_model)
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=True) if distributed else compiled_model
 
     # Optimizer split
     block_named_params = list(base_model.blocks.named_parameters())
