@@ -716,11 +716,16 @@ class Block(nn.Module):
         is_block_start = self.layer_idx > 0 and self.layer_idx % layers_per_block == 0
 
         # === Block AttnRes before attention ===
-        # Attend over the INPUT (partial_block) first, before any reset at block boundaries
+        # Attend over completed blocks + current partial_block BEFORE checking boundary.
+        # This order is critical: AttnRes reads the partial_block, then we optionally reset it.
+        # The next layer's AttnRes will attend over the reset (zero-initialized) partial_block,
+        # which is equivalent to the pseudocode's `partial_block = None` pattern.
         h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
         # === Check block boundary AFTER attention ===
-        # Store completed block and reset for fresh accumulation
+        # At block boundaries (layers 2, 4, 6, ... for block_size=4), store the completed
+        # block and reset partial_block to zeros. Resetting to zeros (vs None) is equivalent
+        # because adding zero has no effect - this matches the pseudocode semantics.
         if is_block_start:
             block_storage[block_ptr] = partial_block
             block_ptr += 1
