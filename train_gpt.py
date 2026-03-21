@@ -535,7 +535,7 @@ def block_attn_res(
 # -----------------------------
 
 class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
+    def __init__(self, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
 
@@ -719,14 +719,10 @@ class Block(nn.Module):
             block_ptr += 1
             # Reset partial_block to start fresh accumulation for next block
             partial_block = torch.zeros_like(partial_block)
-            # Compute new h from block storage for MLP (includes newly stored block)
-            V = block_storage[:block_ptr]
-            K = self.mlp_norm(V)
-            logits = torch.einsum('d, n b t d -> n b t', self.mlp_res_proj.weight.squeeze(), K)
-            h = torch.einsum('n b t, n b t d -> b t d', torch.softmax(logits, dim=0), V)
-        else:
-            # Normal intra-block flow
-            h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
+
+        # === Block AttnRes before MLP ===
+        # Always include partial_block in the attention computation
+        h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
