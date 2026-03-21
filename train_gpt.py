@@ -735,10 +735,17 @@ class Block(nn.Module):
         """
         layers_per_block = self.block_size // 2
         # Block boundary check: only trigger at layers 2, 4, 6, ... (NOT layer 0)
-        # Note: Unlike the spec which checks `layer_number % 2 == 0`, we exclude layer 0
-        # because the normalized embedding is already stored as block_storage[0].
-        # This treats [embedding + layer 0 + layer 1] as the first complete block,
-        # rather than storing separate blocks at layer 0 and layer 2.
+        #
+        # Architectural choice: The spec's `layer_number % layers_per_block == 0` creates
+        # malformed blocks because it triggers boundaries at layer 0, 2, 4, ..., which
+        # doesn't properly account for the embedding being the first block.
+        #
+        # This implementation fixes that by:
+        # - Storing embedding as block_storage[0] (block_ptr starts at 1)
+        # - Triggering boundaries at layers 2, 4, 6, ... (where layer_idx > 0)
+        # - Creating asymmetric blocks: first block = [embed + attn0 + mlp0], subsequent blocks = [attnN + mlpN]
+        #
+        # This ensures all blocks are complete and well-formed.
         is_block_start = self.layer_idx > 0 and self.layer_idx % layers_per_block == 0
 
         # === Block AttnRes before attention ===
