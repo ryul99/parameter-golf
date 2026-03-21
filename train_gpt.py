@@ -734,11 +734,10 @@ class Block(nn.Module):
         # === Check block boundary AFTER AttnRes ===
         # This matches the spec order: apply block_attn_res first, then check boundary.
         if is_block_start:
-            # Clone entire block_storage to create a new tensor that's not part of the computation graph
-            # This is necessary to avoid in-place modification errors with autograd
-            block_storage = block_storage.clone()
-            # Store the completed block
-            block_storage[block_ptr] = partial_block.clone()
+            # Store the completed block - use copy_ to maintain gradient flow
+            # We need to create a detached clone first to avoid in-place modification
+            detached_block = partial_block.detach().clone()
+            block_storage[block_ptr].copy_(detached_block)
             block_ptr += 1
             partial_block = None
 
@@ -806,11 +805,9 @@ class GPT(nn.Module):
         # block_size counts ATTN+MLP, so we have one block every block_size//2 layers
         # +1 for the embedding, which serves as the first block (before layer 0 processes)
         self.num_block_slots = num_layers // (block_size // 2) + 1
-        self.register_buffer(
-            "block_storage",
-            torch.zeros(self.num_block_slots, 1, 1, model_dim, dtype=torch.bfloat16),
-            persistent=False,
-        )
+        self.model_dim = model_dim
+        # Note: block_storage is NOT registered as a buffer to avoid DDP tracking it
+        # It's created fresh during each forward pass
 
         self._init_weights()
 
@@ -828,9 +825,9 @@ class GPT(nn.Module):
         # Initialize Block AttnRes state
         bsz, seq_len, dim = x.shape
 
-        # Create working block_storage from registered buffer
-        # Clone to create independent tensor, then expand to match input dimensions
-        block_storage = self.block_storage.clone().expand(-1, bsz, seq_len, dim).contiguous()
+        # Create fresh block_storage tensor for each forward pass
+        # This avoids DDP tracking this non-parameter tensor
+        block_storage = torch.zeros(self.num_block_slots, bsz, seq_len, dim, dtype=x.dtype, device=x.device)
         # NOTE: Per spec, embedding should be stored as block 0 before layer loop starts.
         # Current implementation stores it at layer 0 boundary, which means first
         # block_attn_res call returns embedding directly without attending over any blocks.
