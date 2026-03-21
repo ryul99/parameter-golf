@@ -290,6 +290,12 @@ class AttnResContext:
     is_block_boundary: bool
 
 
+def detached_array(x: mx.array) -> mx.array:
+    # Stored block memories should not keep the full upstream autograd graph alive.
+    stop_gradient = getattr(mx, "stop_gradient", None)
+    return stop_gradient(x) if stop_gradient is not None else x
+
+
 def block_attn_res(
     blocks_reps: list[mx.array],
     partial_block: mx.array,
@@ -478,8 +484,12 @@ class Block(nn.Module):
 
         # Handle block boundary: finalize current block and start new one
         if attnres_ctx is not None and attnres_ctx.is_block_boundary:
-            attnres_ctx.blocks_reps.append(partial_block)
+            # Store a detached block memory so later blocks do not retain the full graph.
+            attnres_ctx.blocks_reps.append(detached_array(partial_block))
             partial_block = None
+
+        if attnres_ctx is not None:
+            attnres_ctx.partial_block = partial_block
 
         # Return both x (for skip connections) and partial_block (for next layer)
         return x, partial_block
@@ -517,6 +527,14 @@ class GPT(nn.Module):
         ]
         self.final_norm = RMSNormNoWeight()
 
+        # Initialize projection weights to zero and embeddings with small random values
+        for b in self.blocks:
+            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        self.tok_emb.weight = (
+            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+        ).astype(COMPUTE_DTYPE)
+
     @staticmethod
     def _compute_block_boundaries(num_layers: int, num_blocks: int) -> set[int]:
         """Compute which layer indices end each block."""
@@ -531,13 +549,6 @@ class GPT(nn.Module):
         # Ensure boundaries don't exceed num_layers
         return {b for b in boundaries if b < num_layers}
 
-        for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
-        self.tok_emb.weight = (
-            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
-        ).astype(COMPUTE_DTYPE)
-
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
@@ -549,7 +560,7 @@ class GPT(nn.Module):
         # Initialize Block AttnRes context
         if self.num_attnres_blocks > 1:
             attnres_ctx = AttnResContext(
-                blocks_reps=[x],  # Token embedding is first block representation
+                blocks_reps=[detached_array(x)],  # Token embedding is first detached block memory
                 partial_block=None,
                 is_block_boundary=False,
             )
@@ -563,6 +574,8 @@ class GPT(nn.Module):
             is_boundary = (i + 1) in self.block_boundaries
             if attnres_ctx:
                 attnres_ctx.is_block_boundary = is_boundary
+                if len(attnres_ctx.blocks_reps) > self.num_attnres_blocks:
+                    attnres_ctx.blocks_reps = attnres_ctx.blocks_reps[-self.num_attnres_blocks:]
             x, _ = self.blocks[i](x, x0, attnres_ctx)
             skips.append(x)
 
@@ -574,7 +587,17 @@ class GPT(nn.Module):
             is_boundary = (layer_idx + 1) in self.block_boundaries
             if attnres_ctx:
                 attnres_ctx.is_block_boundary = is_boundary
+                # Clean up old block representations to prevent memory leak
+                # Keep only recent blocks that are still relevant for attention
+                if len(attnres_ctx.blocks_reps) > self.num_attnres_blocks:
+                    # Remove oldest block representations beyond what we need
+                    attnres_ctx.blocks_reps = attnres_ctx.blocks_reps[-self.num_attnres_blocks:]
             x, _ = self.blocks[layer_idx](x, x0, attnres_ctx)
+
+        # Clean up block representations at end of forward pass to prevent memory leak
+        if attnres_ctx is not None:
+            attnres_ctx.blocks_reps.clear()
+            attnres_ctx.partial_block = None
 
         return self.final_norm(x)
 
@@ -896,12 +919,19 @@ def loss_and_grad_chunked(
     for chunk_tokens in chunk_sizes:
         x, y = train_loader.next_batch(chunk_tokens, args.train_seq_len)
         loss, grads = compiled_loss_and_grad(x, y)
+        # Materialize gradients immediately to prevent computation graph buildup
+        mx.eval(grads)
         scale = float(y.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
         if args.mlx_eager_eval:
             mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
-    return loss_value, tree_unflatten(list(grad_accum.items()))
+        del x, y, loss, grads
+    # Final evaluation to ensure all operations are materialized
+    mx.eval(loss_value)
+    grads_tree = tree_unflatten(list(grad_accum.items()))
+    mx.eval(grads_tree)
+    return loss_value, grads_tree
 
 
 def eval_val(
@@ -1130,6 +1160,7 @@ def main() -> None:
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
+            del accum, warmup_loss, grads
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
 
@@ -1195,10 +1226,12 @@ def main() -> None:
                 mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
 
         grads = tree_unflatten(list(accum.items()))
+        mx.eval(grads)  # Materialize final gradients before clipping
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
+        del accum, grads, train_loss, loss
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
