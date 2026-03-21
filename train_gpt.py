@@ -711,15 +711,6 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(h))
         partial_block = partial_block + attn_out
 
-        # === Check block boundary AFTER attention, before MLP ===
-        # (layer_idx + 1) because we've just completed layer_idx's attention
-        if (self.layer_idx + 1) % layers_per_block == 0:
-            # At block boundary: store completed block and start fresh accumulation
-            block_storage[block_ptr] = partial_block
-            block_ptr += 1
-            # Reset partial_block to start fresh accumulation for next block
-            partial_block = torch.zeros_like(partial_block)
-
         # === Block AttnRes before MLP ===
         # Always include partial_block in the attention computation
         h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
@@ -727,6 +718,15 @@ class Block(nn.Module):
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
         partial_block = partial_block + mlp_out
+
+        # === Check block boundary AFTER MLP ===
+        # (layer_idx + 1) because we've just completed layer_idx's MLP
+        if (self.layer_idx + 1) % layers_per_block == 0:
+            # At block boundary: store completed block and start fresh accumulation
+            block_storage[block_ptr] = partial_block
+            block_ptr += 1
+            # Reset partial_block to start fresh accumulation for next block
+            partial_block = torch.zeros_like(partial_block)
 
         return block_storage, block_ptr, partial_block
 
