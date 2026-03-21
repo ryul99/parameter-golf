@@ -513,7 +513,7 @@ def block_attn_res(
 
     Args:
         block_storage: [max_blocks, B, T, D] - pre-allocated tensor for block representations
-        block_ptr: int - number of active blocks in storage
+        block_ptr: int - number of active blocks in storage (always >= 1 since embedding is block 0)
         partial_block: [B, T, D] or None - intra-block partial sum (None at block start)
         proj: Linear projection layer for query
         norm_fn: normalization function (e.g., RMSNorm)
@@ -521,18 +521,6 @@ def block_attn_res(
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    if block_ptr == 0:
-        # No completed blocks yet - use projection weights to scale partial_block
-        if partial_block is not None:
-            # Normalize and apply learned scaling via projection weights
-            h_norm = norm_fn(partial_block)
-            # proj.weight is [1, D], h_norm is [B, T, D]
-            # Use element-wise multiplication followed by sum over D to get scalar scaling
-            scaling = (h_norm * proj.weight.unsqueeze(0).unsqueeze(0)).sum(dim=-1, keepdim=True)  # [B, T, 1]
-            return partial_block * scaling
-        else:
-            return torch.zeros_like(block_storage[0])
-
     # Stack active blocks and optionally partial_block
     # V: [num_blocks, B, T, D]
     blocks_list = [block_storage[i] for i in range(block_ptr)]
@@ -846,10 +834,9 @@ class GPT(nn.Module):
         else:
             self.block_storage.zero_()
 
-        # NOTE: Per spec, embedding should be stored as block 0 before layer loop starts.
-        # Current implementation stores it at layer 0 boundary, which means first
-        # block_attn_res call returns embedding directly without attending over any blocks.
-        block_ptr = 0
+        # Per spec, embedding should be stored as block 0 before layer loop starts.
+        self.block_storage[0] = x.detach().clone()
+        block_ptr = 1
 
         # Process all layers
         for block in self.blocks:
