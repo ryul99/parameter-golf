@@ -1006,7 +1006,7 @@ def main() -> None:
 
     restore_fp8_master_params_to_fp32(base_model)
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, compiled_autograd=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=True) if distributed else compiled_model
 
     # Optimizer split
