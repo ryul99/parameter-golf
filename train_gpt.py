@@ -705,16 +705,13 @@ class Block(nn.Module):
             block_ptr: updated number of active blocks
             partial_block: updated intra-block partial sum
         """
-        # Check if we're at the START of a new block
+        # Check if we're at the END of a block
         # block_size counts ATTN + MLP; each transformer layer has 2
         layers_per_block = self.block_size // 2
-        if self.layer_idx % layers_per_block == 0:
+        if self.layer_idx > 0 and self.layer_idx % layers_per_block == 0:
             # At block boundary: store completed block and reset
-            if self.layer_idx > 0:
-                # Store the completed block from previous layers
-                block_storage[block_ptr] = partial_block
-                block_ptr += 1
-            # Reset partial_block to None for the new block
+            block_storage[block_ptr] = partial_block
+            block_ptr += 1
             partial_block = None
 
         # If partial_block is None (start of a block), we need to initialize it
