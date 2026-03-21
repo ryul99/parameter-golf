@@ -776,9 +776,9 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
 
         # Initialize Block AttnRes state
-        # Token embedding is passed as first partial_block, not in blocks list
-        blocks: list[Tensor] = []
-        partial_block: Tensor | None = x
+        # Token embedding is the first completed block
+        blocks: list[Tensor] = [x]
+        partial_block: Tensor | None = None
 
         # Process all layers
         for block in self.blocks:
