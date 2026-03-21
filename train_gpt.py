@@ -537,8 +537,9 @@ def block_attn_res(
 
     # Compute scores for completed blocks (vectorized across blocks)
     K_blocks = F.rms_norm(block_storage[:block_ptr], (block_storage.size(-1),))
-    # Dot product: q [D] @ K_blocks [block_ptr, 1, 1, D] -> [block_ptr, 1, 1]
-    block_scores = (q * K_blocks).sum(dim=-1).squeeze(-1).squeeze(-1)  # [block_ptr]
+    # Dot product: q [D] @ K_blocks [block_ptr, B, T, D] -> [block_ptr, B, T]
+    # Average over B and T to get per-block scores
+    block_scores = (q * K_blocks).sum(dim=-1).mean(dim=(1, 2))  # [block_ptr]
     attn_weights[:block_ptr] = block_scores
 
     # Compute scores for partial block if exists
