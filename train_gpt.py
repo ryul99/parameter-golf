@@ -69,6 +69,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    attnres_q_init_std = float(os.environ.get("ATTNRES_Q_INIT_STD", "0.02"))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -289,7 +291,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain,skip_weight,skip_weights,attn_res_q",
     ).split(",")
     if pattern
 )
@@ -494,6 +496,51 @@ class DistributedTokenLoader:
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
+# FULL ATTENTION RESIDUALS
+# -----------------------------
+
+def attn_res(
+    prev_layers: list[Tensor],
+    query_vec: Tensor,
+    norm_fn: Callable[[Tensor], Tensor],
+) -> Tensor:
+    """
+    Apply attention over all previous layer outputs.
+
+    This implements Full Attention Residuals (AttnRes) which allows each
+    layer to selectively attend over all previous layer representations using
+    a learned pseudo-query vector.
+
+    Args:
+        prev_layers: list of [B, T, D] tensors from previous layers
+        query_vec: [D] - learned pseudo-query vector
+        norm_fn: normalization function (e.g., RMSNorm)
+
+    Returns:
+        [B, T, D] - attention-computed hidden state
+    """
+    if not prev_layers:
+        raise ValueError("prev_layers cannot be empty")
+
+    # Stack all previous layers: [N, B, T, D]
+    V = torch.stack(prev_layers, dim=0)
+
+    # Normalize keys: [N, B, T, D]
+    K = norm_fn(V)
+
+    # Compute logits: query_vec @ K -> [N, B, T]
+    logits = torch.sum(query_vec.view(1, 1, 1, -1) * K, dim=-1)
+
+    # Softmax over layer dimension: [N, B, T]
+    weights = torch.softmax(logits, dim=0)
+
+    # Weighted sum: [N, B, T, D] -> [B, T, D]
+    h = torch.sum(weights.unsqueeze(-1) * V, dim=0)
+
+    return h
+
+
+# -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
 
@@ -626,6 +673,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attnres_q_init_std: float = 0.02,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -634,14 +682,39 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Full AttnRes query vector (for attending over all previous layers)
+        # Initialized with smaller std dev as this is a learned pseudo-query vector
+        self.attn_res_q = nn.Parameter(torch.randn(dim, dtype=torch.float32) * attnres_q_init_std)
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+    def forward(
+        self,
+        x: Tensor,
+        prev_layers: list[Tensor],
+    ) -> Tensor:
+        """
+        Forward pass with Full Attention Residuals.
+
+        Args:
+            x: Current hidden state [B, T, D]
+            prev_layers: list of [B, T, D] tensors from all previous layers
+
+        Returns:
+            output: Result after this layer [B, T, D]
+        """
+        # === Full AttnRes before attention ===
+        h = attn_res(prev_layers, self.attn_res_q, self.attn_norm)
+
+        # Self-attention with residual
+        attn_out = self.attn(self.attn_norm(h))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+
+        # === Full AttnRes before MLP ===
+        h = attn_res(prev_layers + [x], self.attn_res_q, self.mlp_norm)
+
+        # MLP with residual
+        mlp_out = self.mlp(self.mlp_norm(h))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+
         return x
 
 
@@ -659,6 +732,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attnres_q_init_std: float = 0.02,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +754,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attnres_q_init_std,
                 )
                 for i in range(num_layers)
             ]
@@ -700,17 +775,24 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+
+        # Initialize Full AttnRes state with token embedding
+        prev_layers: list[Tensor] = [x]
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
+        # Encoder phase: accumulate skip connections
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, prev_layers)
+            prev_layers.append(x)
             skips.append(x)
+
+        # Decoder phase: consume skip connections
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            x = self.blocks[layer_idx](x, prev_layers)
+            prev_layers.append(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,6 +917,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attnres_q_init_std=args.attnres_q_init_std,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -897,6 +980,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attnres q_init_std={args.attnres_q_init_std}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
