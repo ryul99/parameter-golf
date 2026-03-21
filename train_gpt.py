@@ -716,36 +716,39 @@ class Block(nn.Module):
         """
         layers_per_block = self.block_size // 2
 
-        # Reset partial_block to current layer's input (spec: partial_block = hidden_states)
+        # Reset partial_block to current layer's input (hidden_states from previous layer)
         partial_block = hidden_states
 
-        # Block boundary check: trigger at layers 0, 2, 4, ...
-        # Spec: layer_number % (block_size // 2) == 0
+        # Block boundary detection: layers 0, 2, 4, ... are block starts
         is_block_start = self.layer_idx % layers_per_block == 0
 
-        # === Block AttnRes before attention ===
-        # Attend over completed blocks + current partial_block.
+        # === Apply inter-block attention BEFORE self-attention ===
+        # Attend over all completed block representations + current partial_block.
+        # This produces h, which serves as the query vector for self-attention.
         h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
-        # === Check block boundary AFTER AttnRes ===
-        # This matches the spec order: apply block_attn_res first, then check boundary.
+        # === Block boundary handling ===
         if is_block_start:
-            # Store the completed block - must clone to avoid memory sharing
-            # Don't use copy_ on the storage tensor as it creates references
+            # Store the accumulated output from the previous completed block.
+            # partial_block at this point = hidden_states, which is the output of previous block.
+            # Must clone to prevent later in-place modifications from affecting stored state.
             block_storage[block_ptr] = partial_block.detach().clone()
             block_ptr += 1
+            # Reset accumulation: next layer starts fresh (attn_out becomes new partial_block)
             partial_block = None
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
+        # Accumulate: start new partial_block or add to existing one
         partial_block = attn_out if partial_block is None else partial_block + attn_out
 
-        # === Block AttnRes before MLP ===
+        # === Apply inter-block attention BEFORE MLP ===
+        # Attend over completed blocks + current partial_block (which now contains attn_out)
         h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
         # MLP layer
         mlp_out = self.mlp(self.mlp_norm(h))
-        # partial_block should never be None here (always set after attention)
+        # partial_block is always non-None here (set after attention layer)
         partial_block = partial_block + mlp_out  # type: ignore[arg-type]
 
         return block_storage, block_ptr, partial_block
