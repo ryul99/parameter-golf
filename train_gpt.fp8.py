@@ -610,10 +610,11 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        # SDPA doesn't support FP8, cast to bfloat16 for attention
         y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q.to(dtype=torch.bfloat16),
+            k.to(dtype=torch.bfloat16),
+            v.to(dtype=torch.bfloat16),
             attn_mask=None,
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
