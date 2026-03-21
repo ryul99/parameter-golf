@@ -897,6 +897,9 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 def main() -> None:
     global zeropower_via_newtonschulz5
 
+    # Enable scalar output capture for dynamo to support .item() calls in FP8Linear
+    torch._dynamo.config.capture_scalar_outputs = True
+
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
