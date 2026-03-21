@@ -713,23 +713,19 @@ class Block(nn.Module):
             partial_block: updated intra-block partial sum
         """
         layers_per_block = self.block_size // 2
-        is_block_start = self.layer_idx > 0 and self.layer_idx % layers_per_block == 0
+        is_block_start = self.layer_idx % layers_per_block == 0
 
-        # === Block AttnRes before attention ===
-        # Attend over completed blocks + current partial_block BEFORE checking boundary.
-        # This order is critical: AttnRes reads the partial_block, then we optionally reset it.
-        # The next layer's AttnRes will attend over the reset (zero-initialized) partial_block,
-        # which is equivalent to the pseudocode's `partial_block = None` pattern.
-        h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
-
-        # === Check block boundary AFTER attention ===
-        # At block boundaries (layers 2, 4, 6, ... for block_size=4), store the completed
-        # block and reset partial_block to zeros. Resetting to zeros (vs None) is equivalent
-        # because adding zero has no effect - this matches the pseudocode semantics.
+        # === Check block boundary BEFORE AttnRes (matches spec order) ===
+        # At block boundaries (layers 0, 2, 4, ... for block_size=4), store the completed
+        # block and reset partial_block to zeros before applying AttnRes.
         if is_block_start:
             block_storage[block_ptr] = partial_block
             block_ptr += 1
             partial_block = torch.zeros_like(partial_block)
+
+        # === Block AttnRes before attention ===
+        # Attend over completed blocks + current partial_block (which may be zero-initialized).
+        h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
@@ -792,7 +788,7 @@ class GPT(nn.Module):
 
         # Pre-allocate storage for block representations
         # block_size counts ATTN+MLP, so we have one block every block_size//2 layers
-        # +1 for the initial embedding storage
+        # +1 for the embedding stored at layer 0 (first block boundary)
         self.num_block_slots = num_layers // (block_size // 2) + 1
         self.register_buffer(
             "block_storage",
@@ -818,9 +814,8 @@ class GPT(nn.Module):
 
         # Create working block_storage from registered buffer (don't reassign the buffer)
         block_storage = self.block_storage.expand(-1, bsz, seq_len, dim).contiguous().clone()
-        # Initialize: embedding is stored as first block, and starts as partial_block
-        block_storage[0] = x
-        block_ptr = 1  # Next block slot to use
+        # Initialize: embedding starts as partial_block, will be stored at layer 0 block boundary
+        block_ptr = 0  # First block slot to use (embedding will be stored here at layer 0)
         partial_block: Tensor = x  # Start accumulating from normalized embedding
 
         # Process all layers
