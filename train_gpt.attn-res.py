@@ -681,6 +681,7 @@ class Block(nn.Module):
         attnres_proj_init_std: float = 0.02,
         layer_idx: int = 0,
         block_size: int = 4,
+        num_layers: int = 4,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -696,6 +697,7 @@ class Block(nn.Module):
 
         # Track layer position and block boundaries
         self.layer_idx = layer_idx
+        self.num_layers = num_layers  # Total number of layers (for detecting last layer)
         self.block_size = block_size  # Counts ATTN + MLP; each transformer layer has 2
 
     def forward(
@@ -719,28 +721,19 @@ class Block(nn.Module):
         """
         layers_per_block = self.block_size // 2
 
-        # Receive accumulated output from previous layer/block as the starting point.
-        # At block start: this is the previous block's final accumulated output.
-        # Within block: this is the previous layer's accumulated partial sum.
+        # Initialize partial_block with the input to this layer.
+        # Within a block: this is the accumulated output from the previous layer.
+        # At block start (layer 0, 2, 4, ...): this is the previous block's final accumulated output.
         partial_block = hidden_states
 
-        # Block boundary detection: layers 0, 2, 4, ... are block starts
-        is_block_start = self.layer_idx % layers_per_block == 0
+        # Block boundary detection: we're at the END of a block if this is the last layer in the block
+        # For layers_per_block=2: layers 1, 3, 5, ... are block ends
+        is_block_end = (self.layer_idx + 1) % layers_per_block == 0
 
         # === Apply inter-block attention BEFORE self-attention ===
         # Attend over all completed block representations + current partial_block.
         # This produces h, which serves as the query vector for self-attention.
         h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
-
-        # === Block boundary handling ===
-        if is_block_start:
-            # Store the accumulated output from the previous completed block.
-            # partial_block at this point = hidden_states, which is the output of previous block.
-            # Must clone to prevent later in-place modifications from affecting stored state.
-            block_storage[block_ptr] = partial_block.detach().clone()
-            block_ptr += 1
-            # Reset accumulation: next layer starts fresh (attn_out becomes new partial_block)
-            partial_block = None
 
         # Self-attention layer
         attn_out = self.attn(self.attn_norm(h))
@@ -755,6 +748,21 @@ class Block(nn.Module):
         mlp_out = self.mlp(self.mlp_norm(h))
         # partial_block is always non-None here (set after attention layer)
         partial_block = partial_block + mlp_out  # type: ignore[arg-type]
+
+        # === Block boundary handling (after MLP) ===
+        # Check if this is the last layer (need to preserve partial_block for output)
+        is_last_layer = self.layer_idx == (self.num_layers - 1)
+
+        if is_block_end:
+            # Store the accumulated output from this completed block.
+            # partial_block now contains the sum of all layers in this block.
+            # Must clone to prevent later in-place modifications from affecting stored state.
+            block_storage[block_ptr] = partial_block.detach().clone()
+            block_ptr += 1
+            # Reset accumulation for the next block, unless this is the last layer
+            # (we need to preserve the output for final_norm)
+            if not is_last_layer:
+                partial_block = None
 
         return block_storage, block_ptr, partial_block
 
@@ -795,6 +803,7 @@ class GPT(nn.Module):
                     attnres_proj_init_std,
                     layer_idx=i,
                     block_size=block_size,
+                    num_layers=num_layers,
                 )
                 for i in range(num_layers)
             ]
