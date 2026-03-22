@@ -514,13 +514,20 @@ def block_attn_res(
     Args:
         block_storage: [max_blocks, B, T, D] - pre-allocated tensor for block representations
         block_ptr: int - number of active blocks in storage (always >= 1 since embedding is block 0)
-        partial_block: [B, T, D] or None - intra-block partial sum (None at block start)
-        proj: Linear projection layer for query
+        partial_block: [B, T, D] or None - intra-block partial sum
+        proj: Linear projection layer for query (learned pseudo-query vector)
         norm_fn: normalization function (e.g., RMSNorm)
 
     Returns:
         [B, T, D] - attention-computed hidden state
+
+    NOTE: block_ptr must be >= 1 (embedding stored as block 0 in GPT.forward)
     """
+    if block_ptr < 1:
+        raise ValueError(
+            f"block_ptr must be >= 1 (embedding should be stored at index 0), got {block_ptr}"
+        )
+
     active_blocks = block_storage[:block_ptr]
     V = active_blocks if partial_block is None else torch.cat((active_blocks, partial_block.unsqueeze(0)), dim=0)
 
@@ -528,32 +535,23 @@ def block_attn_res(
     K = norm_fn(V)
     num_blocks, batch_size, seq_len, dim = V.shape
 
-    # Compute query from aggregated state for proper autograd.
-    # CRITICAL: Cannot directly access proj.weight[0] as it breaks the autograd graph,
-    # causing projection parameters to not receive gradients in DDP. Instead, we
-    # call proj() as a proper forward pass on aggregated state to ensure gradients flow.
-    # Use mean of partial_block (or last block) as input to projection
-    if partial_block is not None:
-        query_input = partial_block.mean(dim=(0, 1))  # [D]
-    else:
-        query_input = active_blocks[-1].mean(dim=(0, 1))  # [D]
+    # Compute attention using learned pseudo-query vector (spec: proj.weight.squeeze())
+    # The query is a fixed learned vector w_l of shape [D], independent of input content
+    # This is the core of AttnRes: each layer has a learned pseudo-query for attending over previous blocks
+    query = proj.weight.squeeze()  # [D] - learned pseudo-query vector
 
-    # Project to get scalar, expand to dim for attention
-    # This ensures proj parameters are in the computation graph
-    q_scalar = proj(query_input)  # [1]
-    q = q_scalar * torch.ones(dim, device=V.device, dtype=V.dtype)  # [D]
-    q = q.expand(batch_size * seq_len, dim)  # [B*T, D]
-    k = K.permute(1, 2, 0, 3).reshape(batch_size * seq_len, num_blocks, dim)  # [B*T, num_blocks, D]
-    v = V.permute(1, 2, 0, 3).reshape(batch_size * seq_len, num_blocks, dim)  # [B*T, num_blocks, D]
+    # Compute logits: einsum over query and normalized keys
+    # query: [D], K: [N, B, T, D] -> logits: [N, B, T]
+    logits = torch.einsum('d, n b t d -> n b t', query, K)
 
-    # Compute attention scores: [B*T, num_blocks]
-    scores = torch.bmm(q.unsqueeze(1), k.transpose(1, 2)).squeeze(1) / (dim ** 0.5)
-    attn_weights = torch.softmax(scores, dim=-1)  # [B*T, num_blocks]
+    # Apply softmax over block dimension to get attention weights
+    attn_weights = torch.softmax(logits, dim=0)  # [N, B, T]
 
-    # Apply attention to values: [B*T, D]
-    h = torch.bmm(attn_weights.unsqueeze(1), v).squeeze(1)
+    # Apply attention to values: weighted sum over blocks
+    # attn_weights: [N, B, T], V: [N, B, T, D] -> h: [B, T, D]
+    h = torch.einsum('n b t, n b t d -> b t d', attn_weights, V)
 
-    return h.reshape(batch_size, seq_len, dim).contiguous()
+    return h
 
 
 # -----------------------------
@@ -695,6 +693,18 @@ class Block(nn.Module):
         num_layers: int = 4,
     ):
         super().__init__()
+        # Validate block_size is even (must count ATTN + MLP operations)
+        if block_size % 2 != 0:
+            raise ValueError(
+                f"block_size must be even (counts ATTN + MLP operations), got {block_size}"
+            )
+        layers_per_block = block_size // 2
+        if layers_per_block == 0:
+            raise ValueError(
+                f"block_size must be >= 2, got {block_size}. "
+                f"This would produce layers_per_block=0, causing division by zero."
+            )
+
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -716,7 +726,7 @@ class Block(nn.Module):
         block_storage: Tensor,
         block_ptr: int,
         hidden_states: Tensor,
-    ) -> tuple[Tensor, int, Tensor | None]:
+    ) -> tuple[Tensor, int, Tensor]:
         """
         Forward pass with Block Attention Residuals.
 
@@ -728,7 +738,7 @@ class Block(nn.Module):
         Returns:
             block_storage: updated block storage tensor
             block_ptr: updated number of active blocks
-            partial_block: accumulated output from this layer (for next layer to receive)
+            h: transformed hidden state from inter-block attention (output to next layer)
 
         IMPLEMENTATION NOTE: Block boundary handling differs from the spec pseudocode in attention_residuals.md:
             - Spec checks `layer_number % (block_size // 2) == 0` at LAYER START (before processing)
@@ -737,12 +747,19 @@ class Block(nn.Module):
               This stores the ACCUMULATED OUTPUT after completing each block (layers 1, 3, 5, ...)
             - The spec's approach appears to have a bug: storing unprocessed inputs and duplicating the embedding
             - This implementation stores the actual processed block representation, which is semantically correct
+
+        KEY ARCHITECTURAL DIFFERENCE:
+            - This implementation returns the transformed hidden state `h` (from the second block_attn_res call)
+              as the output to the next layer, NOT the accumulated `partial_block`
+            - The `partial_block` is used for intra-block accumulation and for inter-block attention
+            - This ensures each layer receives the transformed output from the previous layer as input
         """
         layers_per_block = self.block_size // 2
 
-        # Initialize partial_block with the input to this layer.
-        # Within a block: this is the accumulated output from the previous layer.
-        # At block start (layer 0, 2, 4, ...): this is the previous block's final accumulated output.
+        # Initialize partial_block with the input to this layer (hidden_states).
+        # Within a block: this is the transformed output h from the previous layer's inter-block attention.
+        # At block entry (input to layers 0, 2, 4, ...): this is the previous block's final transformed output.
+        # The partial_block accumulates THIS layer's attn+mlp outputs on top of its input.
         partial_block = hidden_states
 
         # Block boundary detection: we're at the END of a block if this is the last layer in the block
@@ -759,8 +776,10 @@ class Block(nn.Module):
 
         # Self-attention layer (normalize h before attention)
         attn_out = self.attn(self.attn_norm(h))
-        # Accumulate: start new partial_block or add to existing one
-        partial_block = attn_out if partial_block is None else partial_block + attn_out
+        # Accumulate: add attention output to partial_block
+        # (partial_block is always initialized at line 756, never None here)
+        assert partial_block is not None, "partial_block must not be None"
+        partial_block = partial_block + attn_out
 
         # === Apply inter-block attention BEFORE MLP ===
         # Attend over completed blocks + current partial_block (which now contains attn_out)
@@ -769,30 +788,54 @@ class Block(nn.Module):
         # MLP layer (normalize h before MLP)
         mlp_out = self.mlp(self.mlp_norm(h))
         # partial_block is always non-None here (set after attention layer)
-        partial_block = partial_block + mlp_out  # type: ignore[arg-type]
+        assert partial_block is not None, "partial_block must not be None after attention layer"
+        partial_block = partial_block + mlp_out
 
         # === Block boundary handling (after MLP) ===
         # Check if this is the last layer (need to preserve partial_block for output)
         is_last_layer = self.layer_idx == (self.num_layers - 1)
 
         if is_block_end:
+            # Validate block_ptr bounds before storing
+            if block_ptr >= block_storage.shape[0]:
+                raise RuntimeError(
+                    f"Block storage overflow: block_ptr={block_ptr} >= "
+                    f"num_block_slots={block_storage.shape[0]}. "
+                    f"Layer {self.layer_idx}, num_layers={self.num_layers}, block_size={self.block_size}"
+                )
+            # Validate partial_block is not None before storing
+            if partial_block is None:
+                raise RuntimeError(
+                    f"partial_block is None at block boundary (layer {self.layer_idx}). "
+                    f"This indicates a bug in block accumulation logic."
+                )
+            # Validate tensor shape matches
+            expected_shape = block_storage[block_ptr].shape
+            actual_shape = partial_block.shape
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"Shape mismatch storing block: expected {expected_shape}, got {actual_shape}. "
+                    f"block_ptr={block_ptr}, layer_idx={self.layer_idx}"
+                )
+
             # Store the ACCUMULATED OUTPUT from this completed block.
             # This differs from the spec pseudocode which stores at layer START (before processing):
             #   - Spec would store: embedding at layer 0 (redundant), then inputs to layers 2, 4, ...
             #   - This implementation stores: processed outputs after layers 1, 3, 5, ...
             # The spec's approach appears buggy as it stores unprocessed inputs and duplicates the embedding.
             # Storing the accumulated output (after attn + MLP) captures the actual block representation.
-            # Store the accumulated output from this completed block.
-            # partial_block now contains the sum of all layers in this block.
             # Must clone to prevent later in-place modifications from affecting stored state.
-            block_storage[block_ptr] = partial_block.detach().clone()
+            # CRITICAL: Do NOT use detach() here - it breaks gradient flow to earlier blocks!
+            block_storage[block_ptr] = partial_block.clone()
             block_ptr += 1
-            # Reset accumulation for the next block, unless this is the last layer
-            # (we need to preserve the output for final_norm)
-            if not is_last_layer:
-                partial_block = None
+            # Reset accumulation for the next block (start fresh)
+            # The next layer will receive h (transformed output) as its input via GPT.forward
+            partial_block = None
 
-        return block_storage, block_ptr, partial_block
+        # Return the transformed hidden state (h) as the output to the next layer
+        # This is the key difference from the accumulated partial_block
+        # h is the output of inter-block attention, which becomes the input to the next layer
+        return block_storage, block_ptr, h
 
 
 class GPT(nn.Module):
@@ -846,6 +889,11 @@ class GPT(nn.Module):
         # +1 for the embedding, which serves as the first block (before layer 0 processes)
         # Use ceiling division to ensure we have enough slots for all possible block boundaries
         self.num_block_slots = (num_layers + block_size // 2 - 1) // (block_size // 2) + 1
+        if self.num_block_slots <= 0:
+            raise ValueError(
+                f"Invalid num_block_slots calculation: {self.num_block_slots}. "
+                f"num_layers={num_layers}, block_size={block_size}"
+            )
         self.model_dim = model_dim
 
         self._init_weights()
@@ -870,18 +918,19 @@ class GPT(nn.Module):
         )
 
         # Per spec, embedding should be stored as block 0 before layer loop starts.
-        block_storage[0] = x.detach().clone()
+        # CRITICAL: Do NOT use detach() here - it breaks gradient flow from attention to embedding!
+        block_storage[0] = x.clone()
         block_ptr = 1
 
         # Process all layers
         for block in self.blocks:
-            block_storage, block_ptr, partial_block = block(
+            block_storage, block_ptr, x = block(
                 block_storage, block_ptr, x
             )
-            x = partial_block  # Update x for next layer (carries forward if not at boundary)
+            # x is now the transformed hidden state h from inter-block attention
+            # This becomes the input to the next layer
 
-        # Use final partial_block as the output (should always be Tensor after all layers)
-        x = partial_block  # type: ignore[assignment]
+        # After all layers, x is the final transformed hidden state
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
