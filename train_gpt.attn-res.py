@@ -529,10 +529,18 @@ def block_attn_res(
     num_blocks, batch_size, seq_len, dim = V.shape
 
     # Express the block reduction as attention with one query per token position.
-    q = proj.weight[0].to(device=V.device, dtype=V.dtype).expand(batch_size * seq_len, 1, 1, dim)
-    k = K.permute(1, 2, 0, 3).reshape(batch_size * seq_len, 1, num_blocks, dim)
-    v = V.permute(1, 2, 0, 3).reshape(batch_size * seq_len, 1, num_blocks, dim)
-    h = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=False, scale=1.0)
+    # Manual implementation to avoid torch.compile issues with non-standard SDP usage
+    q = proj.weight[0].to(device=V.device, dtype=V.dtype)  # [dim]
+    q = q.expand(batch_size * seq_len, dim)  # [B*T, D]
+    k = K.permute(1, 2, 0, 3).reshape(batch_size * seq_len, num_blocks, dim)  # [B*T, num_blocks, D]
+    v = V.permute(1, 2, 0, 3).reshape(batch_size * seq_len, num_blocks, dim)  # [B*T, num_blocks, D]
+
+    # Compute attention scores: [B*T, num_blocks]
+    scores = torch.bmm(q.unsqueeze(1), k.transpose(1, 2)).squeeze(1) / (dim ** 0.5)
+    attn_weights = torch.softmax(scores, dim=-1)  # [B*T, num_blocks]
+
+    # Apply attention to values: [B*T, D]
+    h = torch.bmm(attn_weights.unsqueeze(1), v).squeeze(1)
 
     return h.reshape(batch_size, seq_len, dim).contiguous()
 
