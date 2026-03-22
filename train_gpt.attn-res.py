@@ -528,7 +528,10 @@ def block_attn_res(
     K = norm_fn(V)
     num_blocks, batch_size, seq_len, dim = V.shape
 
-    # Compute query from aggregated state for proper autograd
+    # Compute query from aggregated state for proper autograd.
+    # CRITICAL: Cannot directly access proj.weight[0] as it breaks the autograd graph,
+    # causing projection parameters to not receive gradients in DDP. Instead, we
+    # call proj() as a proper forward pass on aggregated state to ensure gradients flow.
     # Use mean of partial_block (or last block) as input to projection
     if partial_block is not None:
         query_input = partial_block.mean(dim=(0, 1))  # [D]
