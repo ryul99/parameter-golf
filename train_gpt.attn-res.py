@@ -715,11 +715,13 @@ class Block(nn.Module):
         Returns:
             block_storage: updated block storage tensor
             block_ptr: updated number of active blocks
-            partial_block: updated intra-block partial sum
+            partial_block: accumulated output from this layer (for next layer to receive)
         """
         layers_per_block = self.block_size // 2
 
-        # Reset partial_block to current layer's input (hidden_states from previous layer)
+        # Receive accumulated output from previous layer/block as the starting point.
+        # At block start: this is the previous block's final accumulated output.
+        # Within block: this is the previous layer's accumulated partial sum.
         partial_block = hidden_states
 
         # Block boundary detection: layers 0, 2, 4, ... are block starts
