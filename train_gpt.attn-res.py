@@ -718,6 +718,14 @@ class Block(nn.Module):
             block_storage: updated block storage tensor
             block_ptr: updated number of active blocks
             partial_block: accumulated output from this layer (for next layer to receive)
+
+        IMPLEMENTATION NOTE: Block boundary handling differs from the spec pseudocode in attention_residuals.md:
+            - Spec checks `layer_number % (block_size // 2) == 0` at LAYER START (before processing)
+              This would store the INPUT to layers 0, 2, 4, ..., which at layer 0 redundantly stores the embedding
+            - This implementation checks `(layer_idx + 1) % layers_per_block == 0` at LAYER END (after MLP)
+              This stores the ACCUMULATED OUTPUT after completing each block (layers 1, 3, 5, ...)
+            - The spec's approach appears to have a bug: storing unprocessed inputs and duplicating the embedding
+            - This implementation stores the actual processed block representation, which is semantically correct
         """
         layers_per_block = self.block_size // 2
 
@@ -728,6 +736,9 @@ class Block(nn.Module):
 
         # Block boundary detection: we're at the END of a block if this is the last layer in the block
         # For layers_per_block=2: layers 1, 3, 5, ... are block ends
+        # NOTE: This differs from spec pseudocode which checks at layer START (layers 0, 2, 4, ...)
+        # The spec's approach would redundantly store embedding at layer 0 and store unprocessed inputs
+        # This implementation stores the actual accumulated OUTPUT after processing each block
         is_block_end = (self.layer_idx + 1) % layers_per_block == 0
 
         # === Apply inter-block attention BEFORE self-attention ===
@@ -754,6 +765,12 @@ class Block(nn.Module):
         is_last_layer = self.layer_idx == (self.num_layers - 1)
 
         if is_block_end:
+            # Store the ACCUMULATED OUTPUT from this completed block.
+            # This differs from the spec pseudocode which stores at layer START (before processing):
+            #   - Spec would store: embedding at layer 0 (redundant), then inputs to layers 2, 4, ...
+            #   - This implementation stores: processed outputs after layers 1, 3, 5, ...
+            # The spec's approach appears buggy as it stores unprocessed inputs and duplicates the embedding.
+            # Storing the accumulated output (after attn + MLP) captures the actual block representation.
             # Store the accumulated output from this completed block.
             # partial_block now contains the sum of all layers in this block.
             # Must clone to prevent later in-place modifications from affecting stored state.
