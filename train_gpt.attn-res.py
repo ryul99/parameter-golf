@@ -533,7 +533,6 @@ def block_attn_res(
 
     # Compute keys via normalization (over last dim)
     K = norm_fn(V)
-    num_blocks, batch_size, seq_len, dim = V.shape
 
     # Compute attention using learned pseudo-query vector (spec: proj.weight.squeeze())
     # The query is a fixed learned vector w_l of shape [D], independent of input content
@@ -777,8 +776,6 @@ class Block(nn.Module):
         # Self-attention layer (normalize h before attention)
         attn_out = self.attn(self.attn_norm(h))
         # Accumulate: add attention output to partial_block
-        # (partial_block is always initialized at line 756, never None here)
-        assert partial_block is not None, "partial_block must not be None"
         partial_block = partial_block + attn_out
 
         # === Apply inter-block attention BEFORE MLP ===
@@ -787,14 +784,9 @@ class Block(nn.Module):
 
         # MLP layer (normalize h before MLP)
         mlp_out = self.mlp(self.mlp_norm(h))
-        # partial_block is always non-None here (set after attention layer)
-        assert partial_block is not None, "partial_block must not be None after attention layer"
         partial_block = partial_block + mlp_out
 
         # === Block boundary handling (after MLP) ===
-        # Check if this is the last layer (need to preserve partial_block for output)
-        is_last_layer = self.layer_idx == (self.num_layers - 1)
-
         if is_block_end:
             # Validate block_ptr bounds before storing
             if block_ptr >= block_storage.shape[0]:
@@ -828,9 +820,6 @@ class Block(nn.Module):
             # CRITICAL: Do NOT use detach() here - it breaks gradient flow to earlier blocks!
             block_storage[block_ptr] = partial_block.clone()
             block_ptr += 1
-            # Reset accumulation for the next block (start fresh)
-            # The next layer will receive h (transformed output) as its input via GPT.forward
-            partial_block = None
 
         # Return the transformed hidden state (h) as the output to the next layer
         # This is the key difference from the accumulated partial_block
