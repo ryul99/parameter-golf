@@ -528,9 +528,17 @@ def block_attn_res(
     K = norm_fn(V)
     num_blocks, batch_size, seq_len, dim = V.shape
 
-    # Express the block reduction as attention with one query per token position.
-    # Manual implementation to avoid torch.compile issues with non-standard SDP usage
-    q = proj.weight[0].to(device=V.device, dtype=V.dtype)  # [dim]
+    # Compute query from aggregated state for proper autograd
+    # Use mean of partial_block (or last block) as input to projection
+    if partial_block is not None:
+        query_input = partial_block.mean(dim=(0, 1))  # [D]
+    else:
+        query_input = active_blocks[-1].mean(dim=(0, 1))  # [D]
+
+    # Project to get scalar, expand to dim for attention
+    # This ensures proj parameters are in the computation graph
+    q_scalar = proj(query_input)  # [1]
+    q = q_scalar * torch.ones(dim, device=V.device, dtype=V.dtype)  # [D]
     q = q.expand(batch_size * seq_len, dim)  # [B*T, D]
     k = K.permute(1, 2, 0, 3).reshape(batch_size * seq_len, num_blocks, dim)  # [B*T, num_blocks, D]
     v = V.permute(1, 2, 0, 3).reshape(batch_size * seq_len, num_blocks, dim)  # [B*T, num_blocks, D]
@@ -743,10 +751,10 @@ class Block(nn.Module):
 
         # === Apply inter-block attention BEFORE self-attention ===
         # Attend over all completed block representations + current partial_block.
-        # This produces h, which serves as the query vector for self-attention.
+        # The result h is the transformed hidden state from inter-block attention.
         h = block_attn_res(block_storage, block_ptr, partial_block, self.attn_res_proj, self.attn_norm)
 
-        # Self-attention layer
+        # Self-attention layer (normalize h before attention)
         attn_out = self.attn(self.attn_norm(h))
         # Accumulate: start new partial_block or add to existing one
         partial_block = attn_out if partial_block is None else partial_block + attn_out
@@ -755,7 +763,7 @@ class Block(nn.Module):
         # Attend over completed blocks + current partial_block (which now contains attn_out)
         h = block_attn_res(block_storage, block_ptr, partial_block, self.mlp_res_proj, self.mlp_norm)
 
-        # MLP layer
+        # MLP layer (normalize h before MLP)
         mlp_out = self.mlp(self.mlp_norm(h))
         # partial_block is always non-None here (set after attention layer)
         partial_block = partial_block + mlp_out  # type: ignore[arg-type]
