@@ -521,25 +521,20 @@ def block_attn_res(
     Returns:
         [B, T, D] - attention-computed hidden state
     """
-    # Stack active blocks and optionally partial_block
-    # V: [num_blocks, B, T, D]
-    blocks_list = [block_storage[i] for i in range(block_ptr)]
-    if partial_block is not None:
-        blocks_list.append(partial_block)
-    V = torch.stack(blocks_list, dim=0)
+    active_blocks = block_storage[:block_ptr]
+    V = active_blocks if partial_block is None else torch.cat((active_blocks, partial_block.unsqueeze(0)), dim=0)
 
     # Compute keys via normalization (over last dim)
     K = norm_fn(V)
+    num_blocks, batch_size, seq_len, dim = V.shape
 
-    # Compute attention logits: q [D] @ K [N, B, T, D] -> [N, B, T]
-    q = proj.weight.squeeze()  # [D]
-    logits = torch.einsum('d, n b t d -> n b t', q, K)
+    # Express the block reduction as attention with one query per token position.
+    q = proj.weight[0].to(device=V.device, dtype=V.dtype).expand(batch_size * seq_len, 1, 1, dim)
+    k = K.permute(1, 2, 0, 3).reshape(batch_size * seq_len, 1, num_blocks, dim)
+    v = V.permute(1, 2, 0, 3).reshape(batch_size * seq_len, 1, num_blocks, dim)
+    h = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=False, scale=1.0)
 
-    # Softmax over block dimension and aggregate
-    attn_weights = torch.softmax(logits, dim=0)
-    h = torch.einsum('n b t, n b t d -> b t d', attn_weights, V)
-
-    return h.contiguous()
+    return h.reshape(batch_size, seq_len, dim).contiguous()
 
 
 # -----------------------------
