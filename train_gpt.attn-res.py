@@ -900,7 +900,7 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_math_sdp(True)  # Enable math as fallback for non-causal attention in compiled model
 
     logfile = None
     if master_process:
@@ -1029,7 +1029,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=True")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"block_attnres proj_init_std={args.attnres_proj_init_std} block_size={args.block_size}")
     log0(
